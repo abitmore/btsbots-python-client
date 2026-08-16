@@ -1,0 +1,21 @@
+{ 
+    "description": "BitShares 核心 ID 与本位币定价风控策略（集成精度转换）",
+    "updated_at": "2026-08-12 19:54:52",
+    "fee_limit": 10,
+    "authorized_keys": [
+	"f928a9f76a372caf489e999b5e2c4eec9fc1d0be49bcef9b4a",
+	"7bd7aa6d9ca95ef17c53aac6637d6374130454211b551afc72",
+	"73b9068d0be448f0591d95ad2fe91db5263afb50ab1e5b12cb"
+    ],
+    "user_whitelist": {
+        "exchange.btsbots": "1.2.33015",
+        "demo.btsbots": "1.2.36449",
+        "btsbots": "1.2.31073"
+    },
+    "market_whitelist": [
+        "CNY/USD", "CNY/BTS", "BTS/USD"
+    ],
+    "volatility_limit_1h": 0.97,
+    "volatility_limit_1d": 0.95,
+    "volatility_limit_1w": 0.90
+}

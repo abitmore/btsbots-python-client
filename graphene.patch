@@ -1,0 +1,10 @@
+.venv/lib/python3.14/site-packages/graphenebase/ecdsa.py
+# 原代码
+return VerifyingKey.from_public_point(
+    Q._Point__x, Q._Point__y, ec.SECP256K1()
+)
+
+# 修改后的代码
+return VerifyingKey.from_public_point(
+    Q.x(), Q.y(), ec.SECP256K1()
+)
