@@ -4,8 +4,68 @@ import sys
 import termios
 import subprocess
 import multiprocessing
+from functools import wraps
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+
+# 使用 fork 模式：直接内存复制，不读磁盘，且支持 Copy-on-Write 隔离
+ctx = multiprocessing.get_context('fork')
+
+def sandbox_execute(func):
+    """
+    通用沙盒执行装饰器，在 fork 的新的子进程中执行。
+    凡是要求使用密钥的代码，在沙盒中执行解密
+    所有密钥相关的数据，在子进程结束后会被清除。
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if not self._encrypted_key_buffer:
+            raise ValueError("No key loaded. Please ingest a key first.")
+
+        parent_conn, child_conn = ctx.Pipe()
+        
+        # 内部工作函数：在孤立的子进程中跑
+        def _child_worker():
+            temp_plaintext_buffer = None
+            try:
+                # 仅在子进程内存中解密密钥
+                temp_plaintext_buffer = self._decrypt(self._encrypted_key_buffer)
+                if not isinstance(temp_plaintext_buffer, bytearray):
+                    temp_plaintext_buffer = bytearray(temp_plaintext_buffer)
+                
+                # 将解密出来的 wif_buffer 作为第一个参数，动态传给原始的业务函数
+                result = func(self, temp_plaintext_buffer, *args, **kwargs)
+                child_conn.send({'status': 'success', 'result': result})
+            except Exception as e:
+                child_conn.send({'status': 'error', 'message': str(e)})
+            finally:
+                # 擦除子进程内存中的明文密钥
+                if temp_plaintext_buffer:
+                    for i in range(len(temp_plaintext_buffer)):
+                        temp_plaintext_buffer[i] = 0
+                    del temp_plaintext_buffer
+                
+                # 销毁子进程，清除所有第三方加密库留下的脏内存
+                child_conn.close()
+                os._exit(0)
+
+        try:
+            # 启动沙盒进程
+            process = ctx.Process(target=_child_worker)
+            process.start()
+            
+            # 接收子进程返回的数据
+            response = parent_conn.recv()
+            process.join()
+            
+            if response.get('status') == 'error':
+                raise RuntimeError(f"Sandbox error in {func.__name__}: {response.get('message')}")
+                
+            return response.get('result')
+        finally:
+            parent_conn.close()
+
+    return wrapper
 
 class BotsKey:
     """
@@ -95,58 +155,6 @@ class BotsKey:
             del result
             gc.collect()  # 回收变量
 
-    @staticmethod
-    def _sandbox_worker(pipe, secret_byte_list, payload_data, crypto_callback):
-        """在完全隔离的子进程（沙盒）中运行的内部工作函数"""
-        secret_buffer = bytearray(secret_byte_list)
-        try:
-            # 在安全的子进程中执行用户传入的签名或加密
-            result = crypto_callback(secret_buffer, payload_data)
-            pipe.send({"status": "success", "result": result})
-        except Exception as e:
-            pipe.send({"status": "error", "message": str(e)})
-            #import traceback
-            #traceback.print_exc()
-        finally:
-            BotsKey.secure_clear(secret_buffer)
-            pipe.close()
-            os._exit(0)
-
-    def sign_in_sandbox(self, payload_data, crypto_callback) -> str:
-        """
-        在需要签名/加密时，解密密钥并送入沙盒执行。
-        """
-        if not self._encrypted_key_buffer:
-            raise ValueError("No key loaded. Please ingest a key first.")
-            
-        # 解密出密钥
-        temp_plaintext_buffer = self._decrypt(self._encrypted_key_buffer)
-        temp_list = list(temp_plaintext_buffer)
-        
-        parent_conn, child_conn = multiprocessing.Pipe()
-        try:
-            # 密钥送入沙盒，启动新进程执行回调函数
-            process = multiprocessing.Process(
-                target=self._sandbox_worker, 
-                args=(child_conn, temp_list, payload_data, crypto_callback)
-            )
-            process.start()
-            
-            result = parent_conn.recv()
-            process.join()
-        finally:
-            # 清除密钥 
-            self.secure_clear(temp_plaintext_buffer)
-            if "temp_list" in locals():
-                for i in range(len(temp_list)):
-                    temp_list[i] = 0
-                del temp_list  # 解除引用
-        
-        if result["status"] == "success":
-            return result["result"]
-        else:
-            raise RuntimeError(f"Sandbox runtime failure: {result['message']}")
-
     def clear_current_key(self):
         if self._encrypted_key_buffer:
             self._encrypted_key_buffer = None
@@ -155,7 +163,8 @@ class BotsKey:
     def __del__(self):
         self.clear_current_key()
 
-    def _generate_ddp_auth_payload(self, wif_buffer: bytearray, account_name: str) -> dict:
+    @sandbox_execute
+    def generate_ddp_auth_payload(self, wif_buffer: bytearray, account_name: str) -> dict:
         import time
         import json
         from btsbots.graphene_light import PrivateKey
@@ -179,10 +188,8 @@ class BotsKey:
             }
         }
 
-    def generate_ddp_auth_payload(self, account_name: str) -> dict:
-        return self.sign_in_sandbox(account_name, self._generate_ddp_auth_payload)
-
-    def _sign_transaction(self, wif_buffer: bytearray, payload: dict) -> str:
+    @sandbox_execute
+    def sign_transaction(self, wif_buffer: bytearray, payload: dict) -> str:
         import bitsharesbase.signedtransactions as transactions
         #from graphenebase import transactions
         from binascii import unhexlify, hexlify
@@ -208,10 +215,8 @@ class BotsKey:
         final_payload["signatures"] = [custom_sig_hex]
         return final_payload
 
-    def sign_transaction(self, payload: dict) -> dict:
-        return self.sign_in_sandbox(payload, self._sign_transaction)
-
-    def _encrypt_memo(self, wif_buffer: bytearray, payload: dict) -> dict:
+    @sandbox_execute
+    def encrypt_memo(self, wif_buffer: bytearray, payload: dict) -> dict:
         from graphenebase.account import PrivateKey, PublicKey
         from graphenebase.memo import encode_memo
         import struct
@@ -230,6 +235,3 @@ class BotsKey:
             "nonce": str(nonce),
             "message": encrypted_hex
         }
-
-    def encrypt_memo(self, payload: str) -> dict:
-        return self.sign_in_sandbox(payload, self._encrypt_memo)
