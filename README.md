@@ -81,14 +81,13 @@ json
   "authorized_keys": [
     "这里粘贴您复制的客户端公钥"
   ],
-  "allowed_operations": [
-    "limit_order_create",
-    "limit_order_cancel"
-  ],
-  "allowed_transfer_destinations": [
-    "exchange-account",
-    "trusted-friend"
-  ]
+    "user_whitelist": {
+        "angel": "1.2.1000",
+        "dan": "1.2.2000"
+    },
+    "market_whitelist": [
+        "CNY/USD", "CNY/BTS", "BTS/USD"
+    ]
 }
 
 Use code with caution.
