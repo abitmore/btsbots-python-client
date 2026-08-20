@@ -220,18 +220,32 @@ class BotsKey:
         from graphenebase.account import PrivateKey, PublicKey
         from graphenebase.memo import encode_memo
         import struct
-        pub_key = PublicKey(payload["to"])
-        priv_key = PrivateKey(wif_buffer.decode('utf-8'))
+        import random 
+        pub_key = PublicKey(payload["to"], prefix="BTS")
+        priv_key = PrivateKey(wif_buffer.decode('utf-8'), prefix="BTS")
         
-        # 随机生成 64位无符号整数 nonce
-        nonce_tuple = struct.unpack('Q', os.urandom(8))
-        nonce = nonce_tuple[0]
+        nonce_int = random.randint(100000000000000, 9007199254740991)
         
-        encrypted_hex = encode_memo(priv_key, pub_key, nonce, payload["message"])
+        encrypted_hex = encode_memo(priv_key, pub_key, nonce_int, payload["message"])
         
         return {
             "from": str(priv_key.pubkey),
             "to": str(pub_key),
-            "nonce": str(nonce),
+            "nonce": str(nonce_int),
             "message": encrypted_hex
         }
+
+    @sandbox_execute
+    def decrypt_memo(self, wif_buffer: bytearray, memo_dict: dict) -> str:
+        from graphenebase.account import PrivateKey, PublicKey
+        from graphenebase.memo import decode_memo # 💡 引入官方自带的解密函数
+
+        priv_key = PrivateKey(wif_buffer.decode('utf-8'), prefix="BTS")
+        pub_key = PublicKey(memo_dict["from"], prefix="BTS")
+        nonce_int = int(memo_dict["nonce"])
+    
+        # 官方的 decode_memo 内部会自动解 AES、去 Padding 并验证 Checksum
+        # 如果验证失败，它内部会抛出异常
+        plaintext = decode_memo(priv_key, pub_key, nonce_int, memo_dict["message"])
+    
+        return plaintext

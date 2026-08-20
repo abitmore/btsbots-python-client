@@ -80,9 +80,13 @@ class BTSBots(BotsClient):
         item = fee_doc[op[0]]
         calculated_fee = int(item[1].get("fee"))
         if op_code == 0 and op[1].get("memo"):
-            memo = op[1]["memo"]["message"]
-            memo_length_bytes = len(unhexlify(memo))
-            calculated_fee += int(math.ceil(memo_length_bytes * item[1].get("price_per_kbyte")/ 1024.0))
+            cipher_bytes_len = len(unhexlify(op[1]["memo"]["message"]))
+            # 还原 fc::raw::pack_size(memo) 的字节数累加
+            # 33(from) + 33(to) + 8(nonce) + 1(长度标记) + 密文长度
+            #varint_len = 1 if cipher_bytes_len < 128 else 2
+            varint_len = 2
+            total_bytes = 33 + 33 + 8 + varint_len + cipher_bytes_len
+            calculated_fee += total_bytes * item[1].get("price_per_kbyte") // 1024
         op[1]["fee"]["amount"] = calculated_fee 
 
     async def _sign_and_broadcast(self, ops: list, isSim: bool=False) -> int:
@@ -138,10 +142,7 @@ class BTSBots(BotsClient):
 
     async def _build_op_transfer(self, uid: str, op_params: dict) -> list:
         if op_params.get("memo"):
-            raise KeyError("转账功能暂不支持 memo")
-            # TODO test memo
             memo_payload = await self.encrypt_memo(op_params)
-            #print(memo_payload)
 
         _, to_id = await self.get_account_brief(op_params.get("to_account"))
         _, asset_id, asset_prec = await self.get_asset_brief(op_params.get("asset"))
