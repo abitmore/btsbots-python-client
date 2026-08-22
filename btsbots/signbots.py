@@ -70,11 +70,24 @@ class SignBots(BTSBots):
         print("⚡[BTSBots] 零信任安全守卫，签名网关，正在监听中...")
 
     async def _audit_and_sign_worker(self, doc_id: str, fields: dict, success_callback: Optional[Callable]):
+        envelope = fields.get("rawTx", {})
         # 1. 检测公钥是否授权，签名是否合格
-        is_valid_crypto, crypto_msg = self._verify_browser_envelope(fields)
+        is_valid_crypto, crypto_msg = self._verify_browser_envelope(envelope)
         if not is_valid_crypto:
             print(f"x [风控拦截]: {crypto_msg}")
             await self.call('rejectSignRequest', doc_id, f"{crypto_msg}")
+            return
+
+        raw_payload = json.loads(envelope.get("tx_string", "{}"))
+        
+        op_type = raw_payload.get("type")
+        op_params = raw_payload.get("params", {})
+        authenticated_sender_id = fields.get("account_id")
+        account_name = fields.get("account") # 获取当前用户的比特股账号名
+
+        # 处理第三方商户的授权登录（OAuth/扫码）请求
+        if op_type == "oauth_login":
+            await self.oauth_handle(doc_id, fields)
             return
 
         # 2. 检查 fee 是否超过限制
@@ -83,14 +96,6 @@ class SignBots(BTSBots):
             print(f"x [风控拦截]: {msg}")
             await self.call('rejectSignRequest', doc_id, f"{msg}")
             return
-
-        envelope = fields.get("rawTx", {})
-        raw_payload = json.loads(envelope.get("tx_string", "{}"))
-        
-        op_type = raw_payload.get("type")
-        op_params = raw_payload.get("params", {})
-        authenticated_sender_id = fields.get("account_id")
-        is_sim = op_params.get("simulate")
 
         # 3. 检查转账或者下单是否合规
         #print("debug", op_type, op_params, authenticated_sender_id)
@@ -107,8 +112,12 @@ class SignBots(BTSBots):
 
         # 4. 打包签名发送
         try:
+            is_sim = op_params.get("simulate")
             block_num = await self.make_transaction([raw_payload], is_sim)
-            await self.call('submitSignedTx', doc_id, block_num)
+            await self.call('submitSignedTx', doc_id, {
+                "status": "authorized", 
+                "block": block_num
+                })
             if success_callback:
                 success_callback(doc_id, block_num)
             # The transaction has cleared the blockchain validation layer! Log details natively into your SQL tables
@@ -125,6 +134,69 @@ class SignBots(BTSBots):
             #traceback.print_exc()
             await self.call('rejectSignRequest', doc_id, f"网关异常中断: {str(e)}")
 
+    async def oauth_handle(self, doc_id: str, fields: dict):
+        """
+        专门处理第三方商户的 OAuth / 扫码授权登录验证
+        """
+        print(fields)
+        envelope = fields.get("rawTx", {})
+        account_name = fields.get("account", "unknown")
+        authenticated_sender_id = fields.get("account_id")
+
+        raw_payload = json.loads(envelope.get("tx_string", "{}"))
+        
+        op_params = raw_payload.get("params", {})
+
+        print(f"🔐 [OAuth/扫码授权]: 收到用户 [{account_name}] 对商户的身份授权登录请求...")
+
+        # 1. 审查第三方商户参数
+        client_id = op_params.get("client_id")      # 提取商户的用户名 / 标识符
+        session_id = op_params.get("session_id")    # 提取商户出具的临时会话挑战码
+        site = op_params.get("site")    # 提取商户出具的临时会话挑战码
+        
+        if not client_id or not session_id or not site:
+            msg = "授权登录参数不完整，缺少商户 client_id 或会话 session_id"
+            print(f"x [授权风控拦截]: {msg}")
+            await self.call('rejectSignRequest', doc_id, msg)
+            return
+
+        try:
+
+            # python_blockchain_sig = Your_BitShares_Sign_Logic(browser_pubkey)
+            auth_payload = self._generate_auth_payload(self.account_name, site, session_id)
+
+            # 3. 组装准备推送到商户监控队列的完整的安全授权凭证包
+            final_payload = {
+                "client_id": str(client_id).lower().strip(),
+                "verify": auth_payload.get("verify")
+            }
+
+            # =================================================================
+            # 🎯 核心动作二：【通过 RPC 推送至 Meteor 服务端商家监控队列】
+            # 调用钱包站服务端特有的 RPC 方法，由钱包核心服务器将数据安全写入 `login_requests` 集合
+            # 供商户的 Python 机器人在后台抓取并进行最终的免信任密码学交叉核对
+            # =================================================================
+            print(f"📡 正在通过 RPC 向 Meteor 服务器推送授权凭证...")
+            # 假设你在 Meteor 端注册的推送 Method 名字叫 'pushAuthToMerchantQueue'
+            await self.call('pushAuthToMerchantQueue', final_payload)
+
+            print(f"✅ [OAuth/扫码授权]: 成功为分身公钥背书并推送至网站 [{site}] 队列。单号: {session_id}")
+
+            # 4. 🌟 释放并通关 proxy_sign_requests 队列记录
+            # 通过主站兼容的 Method 吐回成功回执，触发网页前端的 await 阻塞瞬间放行，提示用户授权签署成功
+            await self.call('submitSignedTx', doc_id, {
+                "status": "authorized", 
+                "session_id": session_id
+            })
+            return
+
+        except Exception as oauth_err:
+            error_msg = f"授权背书签名或 RPC 推送发生故障: {str(oauth_err)}"
+            print(f"x [OAuth/扫码授权失败]: {error_msg}")
+            # 安全拒绝单子，防止前端无限打转挂起
+            await self.call('rejectSignRequest', doc_id, error_msg)
+            return
+
     def _check_fee_doc(self, op_types: list) -> tuple[bool, str]:
         global_coll = self.collections.get("global", {})
         if not global_coll:
@@ -138,7 +210,7 @@ class SignBots(BTSBots):
                 return False, f"交易费用{fee}BTS, 超过限制: {self.config['fee_limit']}"
         return True,""
 
-    def _verify_browser_envelope(self, doc_fields: dict) -> tuple[bool, str]:
+    def _verify_browser_envelope(self, envelope: dict) -> tuple[bool, str]:
         """
         【安全网络核验接口 - 授权公钥白名单】
         白名单里只存公钥的 50 位 SHA-256 哈希串。
@@ -152,7 +224,6 @@ class SignBots(BTSBots):
         import json
         import time
 
-        envelope = doc_fields.get("rawTx", {})
         tx_string = envelope.get("tx_string")
         pubkey_hex = envelope.get("browser_pubkey")  # 前端传过来的完整 130 位原始公钥
         signature_hex = envelope.get("browser_sig")

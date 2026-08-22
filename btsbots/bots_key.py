@@ -164,29 +164,24 @@ class BotsKey:
         self.clear_current_key()
 
     @sandbox_execute
-    def generate_ddp_auth_payload(self, wif_buffer: bytearray, account_name: str) -> dict:
-        import time
-        import json
+    def sign_message(self, wif_buffer: bytearray, message_str: str) -> dict:
         from btsbots.graphene_light import PrivateKey
         from binascii import hexlify
         pKey = PrivateKey.from_wif(wif_buffer.decode('utf-8'))
         pub_key = pKey.get_public_key()
 
-        auth_data = {
-            "account": account_name,
-            "site": 'btsbots.com',
-            "time": int(time.time())
-        }
-        message_str = json.dumps(auth_data, sort_keys=True)
         sig_bytes = pKey.sign_message(message_str)
         return {
-            "user": account_name,
+            "data": message_str,
             "pubkey": pub_key,
-            "verify": {
-                "data": message_str,
-                "signature": hexlify(sig_bytes).decode('ascii')
-            }
+            "signature": hexlify(sig_bytes).decode('ascii')
         }
+
+    def verify_message(self, payload: dict) -> bool:
+        from btsbots.graphene_light import verify_message as bts_verify_message
+        from binascii import unhexlify
+        return bts_verify_message(
+                payload["data"], unhexlify(payload["signature"]), payload["pubkey"])
 
     @sandbox_execute
     def sign_transaction(self, wif_buffer: bytearray, payload: dict) -> str:
@@ -236,16 +231,17 @@ class BotsKey:
         }
 
     @sandbox_execute
-    def decrypt_memo(self, wif_buffer: bytearray, memo_dict: dict) -> str:
+    def decrypt_memo(self, wif_buffer: bytearray, memo_info: dict) -> str:
         from graphenebase.account import PrivateKey, PublicKey
         from graphenebase.memo import decode_memo # 💡 引入官方自带的解密函数
 
+        keys = memo_info['k']
         priv_key = PrivateKey(wif_buffer.decode('utf-8'), prefix="BTS")
-        pub_key = PublicKey(memo_dict["from"], prefix="BTS")
-        nonce_int = int(memo_dict["nonce"])
+        my_pub = str(priv_key.pubkey)
+        pub_key = keys[1] if my_pub == keys[0] else keys[0]
+        pub_key_obj = PublicKey(pub_key, prefix="BTS")
+        nonce_int = int(memo_info["n"])
     
-        # 官方的 decode_memo 内部会自动解 AES、去 Padding 并验证 Checksum
-        # 如果验证失败，它内部会抛出异常
-        plaintext = decode_memo(priv_key, pub_key, nonce_int, memo_dict["message"])
+        plaintext = decode_memo(priv_key, pub_key_obj, nonce_int, memo_info["m"])
     
         return plaintext

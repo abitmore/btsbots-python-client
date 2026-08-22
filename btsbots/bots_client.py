@@ -49,11 +49,28 @@ class BotsClient(MeteorDDPClient):
             self.active_key.ingest_from_stdin("请输入active WIF Key: ")
             self.memo_key.ingest_from_stdin("请输入memo WIF Key: ")
         
-        auth_payload = self.active_key.generate_ddp_auth_payload(self.account_name)
+        auth_payload = self._generate_auth_payload(self.account_name, 'btsbots.com')
         login_res = await self.call("login", {"btsWallet": auth_payload})
         self.user_id = login_res.get("id")
         _, self.bts_id = await self.get_account_brief(self.account_name)
         print(f"✓ [BotsClient] 登录成功！分配的 Session 用户 ID: {self.user_id}")
+
+    def _generate_auth_payload(self, account_name: str, site: str="btsbots.com", session: str="") -> dict:
+        import time
+        import json
+
+        auth_data = {
+            "account": account_name,
+            "site": site,
+            "session": session,
+            "time": int(time.time())
+        }
+        message_str = json.dumps(auth_data, sort_keys=True)
+        payload = self.active_key.sign_message(message_str)
+        return {
+            "user": account_name,
+            "verify": payload
+        }
 
     async def request_otp(self) -> str:
         """【接口】为当前登录会话申请一个 6 位数字的网页前端一次性登录码 (OTP)"""
@@ -92,6 +109,11 @@ class BotsClient(MeteorDDPClient):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cached_accounts (
                     symbol TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, raw_data TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cached_memo (
+                    id INTEGER PRIMARY KEY, raw_data TEXT NOT NULL
                 )
             """)
             conn.commit()
@@ -173,3 +195,26 @@ class BotsClient(MeteorDDPClient):
         info = await self.get_asset_info(asset_symbol_or_id)
         if info: return info['a'], info['_id'], info['p']
         return None, None, None
+
+    def _get_memo_local(self, memo_id: int) -> dict:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(f"SELECT raw_data FROM cached_memo WHERE id = ?", (memo_id,)).fetchone()
+            if row: return json.loads(row[0])
+        return None
+
+    async def _get_memo_remote(self, memo_id: int) -> dict:
+        print(f"🔍 [SQLite 未命中] 正在通过服务器读取memo信息: {memo_id} ...")
+        meteor_doc = await self.call("get_memo", memo_id)
+        if meteor_doc:
+            return meteor_doc
+        return None
+
+    async def get_memo(self, memo_id: int) -> dict:
+        info = self._get_memo_local(memo_id)
+        if info: return info
+        info = await self._get_memo_remote(memo_id)
+        if info: 
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("INSERT OR REPLACE INTO cached_memo VALUES (?, ?)", (int(info['_id']), json.dumps(info)))
+            return info
+        raise ValueError(f"无法获取memo信息: {memo_id}")
