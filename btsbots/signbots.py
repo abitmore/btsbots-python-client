@@ -27,22 +27,28 @@ class SignBots(BTSBots):
             """)
             conn.commit()
 
-    async def hot_reload_strategy(self, force: bool = False):
-        """【安全策略加载接口】加载规则集，并核对白名单用户名与区块链账户 ID 是否对应"""
+    async def hot_reload_config_file(self, force: bool = False):
         try:
             if not os.path.exists(self.config_path):
                 raise FileNotFoundError(f"Missing mandatory policy file: {self.config_path}")
-            
+
             current_mtime = os.path.getmtime(self.config_path)
             if not force and (current_mtime <= self.last_config_mtime):
                 return
 
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 self.config = json.load(f)
-
-            print(f"🔄[风控配置] 策略文件加载成功。规则版本更新时间: {self.config.get('updated_at')}")
+            print(f"🔄 配置文件加载成功。规则版本更新时间: {self.config.get('updated_at')}")
             self.last_config_mtime = current_mtime
-            
+        except Exception as err:
+            print(f"配置文件解析发生异常: {str(err)}")
+
+    async def hot_reload_strategy(self, force: bool = False):
+        """【安全策略加载接口】加载规则集，并核对白名单用户名与区块链账户 ID 是否对应"""
+        try:
+            if not await self.hot_reload_config_file(force):
+                return
+
             user_whitelist = self.config.get("user_whitelist", {})
             for username, claimed_id in list(user_whitelist.items()):
                 _, _id, = await self.get_account_brief(username)
@@ -60,6 +66,7 @@ class SignBots(BTSBots):
         return str(tx_id)
 
     async def start_signature_queue_listener(self, on_broadcast_success: Optional[Callable[[str, str], None]] = None):
+        await self.hot_reload_strategy()
         def _on_queue_income(action, collection, doc_id, fields):
             asyncio.create_task(self.hot_reload_strategy())
             if collection == 'proxy_sign_requests' and action == 'added':
@@ -75,11 +82,11 @@ class SignBots(BTSBots):
         is_valid_crypto, crypto_msg = self._verify_browser_envelope(envelope)
         if not is_valid_crypto:
             print(f"x [风控拦截]: {crypto_msg}")
-            await self.call('rejectSignRequest', doc_id, f"{crypto_msg}")
+            await self.call('replySignRequest', False, doc_id, f"{crypto_msg}")
             return
 
         raw_payload = json.loads(envelope.get("tx_string", "{}"))
-        
+
         op_type = raw_payload.get("type")
         op_params = raw_payload.get("params", {})
         authenticated_sender_id = fields.get("account_id")
@@ -94,7 +101,7 @@ class SignBots(BTSBots):
         is_safe, msg = self._check_fee_doc([0,1,2])
         if not is_safe:
             print(f"x [风控拦截]: {msg}")
-            await self.call('rejectSignRequest', doc_id, f"{msg}")
+            await self.call('replySignRequest', False, doc_id, f"{msg}")
             return
 
         # 3. 检查转账或者下单是否合规
@@ -104,7 +111,7 @@ class SignBots(BTSBots):
         )
         if not is_safe:
             print(f"x [审核拦截]: {status_msg}")
-            await self.call('rejectSignRequest', doc_id, f"{status_msg}")
+            await self.call('replySignRequest', False, doc_id, f"{status_msg}")
             return
         else:
             print(f"✓ [审核通过]: {status_msg}")
@@ -114,10 +121,8 @@ class SignBots(BTSBots):
         try:
             is_sim = op_params.get("simulate")
             block_num = await self.make_transaction([raw_payload], is_sim)
-            await self.call('submitSignedTx', doc_id, {
-                "status": "authorized", 
-                "block": block_num
-                })
+            await self.call('replySignRequest', True, doc_id,
+                block_num)
             if success_callback:
                 success_callback(doc_id, block_num)
             # The transaction has cleared the blockchain validation layer! Log details natively into your SQL tables
@@ -132,7 +137,7 @@ class SignBots(BTSBots):
             print(f"🚨[网关异常] {e}")
             #import traceback
             #traceback.print_exc()
-            await self.call('rejectSignRequest', doc_id, f"网关异常中断: {str(e)}")
+            await self.call('replySignRequest', False, doc_id, f"网关异常中断: {str(e)}")
 
     async def oauth_handle(self, doc_id: str, fields: dict):
         """
@@ -140,30 +145,37 @@ class SignBots(BTSBots):
         """
         print(fields)
         envelope = fields.get("rawTx", {})
-        account_name = fields.get("account", "unknown")
-        authenticated_sender_id = fields.get("account_id")
+        account_name = fields.get("account")
+        clientIp = fields.get("clientIp")
 
         raw_payload = json.loads(envelope.get("tx_string", "{}"))
-        
+
         op_params = raw_payload.get("params", {})
 
         print(f"🔐 [OAuth/扫码授权]: 收到用户 [{account_name}] 对商户的身份授权登录请求...")
 
         # 1. 审查第三方商户参数
         client_id = op_params.get("client_id")      # 提取商户的用户名 / 标识符
-        session_id = op_params.get("session_id")    # 提取商户出具的临时会话挑战码
+        token = op_params.get("token")    # 提取商户出具的临时会话挑战码
         site = op_params.get("site")    # 提取商户出具的临时会话挑战码
-        
-        if not client_id or not session_id or not site:
-            msg = "授权登录参数不完整，缺少商户 client_id 或会话 session_id"
+        ip = op_params.get("ip")    # 提取商户出具的临时会话挑战码
+
+        if not client_id or not token or not site or not ip:
+            msg = "授权登录参数不完整"
             print(f"x [授权风控拦截]: {msg}")
-            await self.call('rejectSignRequest', doc_id, msg)
+            await self.call('replySignRequest', False, doc_id, msg)
+            return
+
+        if clientIp != ip:
+            msg = "BTSBots client 与商户 client IP 地址不符合"
+            print(f"x [授权风控拦截]: {msg}")
+            await self.call('replySignRequest', False, doc_id, msg)
             return
 
         try:
 
             # python_blockchain_sig = Your_BitShares_Sign_Logic(browser_pubkey)
-            auth_payload = self._generate_auth_payload(self.account_name, site, session_id)
+            auth_payload = self._generate_auth_payload(self.account_name, site, token, ip)
 
             # 3. 组装准备推送到商户监控队列的完整的安全授权凭证包
             final_payload = {
@@ -180,21 +192,19 @@ class SignBots(BTSBots):
             # 假设你在 Meteor 端注册的推送 Method 名字叫 'pushAuthToMerchantQueue'
             await self.call('pushAuthToMerchantQueue', final_payload)
 
-            print(f"✅ [OAuth/扫码授权]: 成功为分身公钥背书并推送至网站 [{site}] 队列。单号: {session_id}")
+            print(f"✅ [OAuth/扫码授权]: 登录站点 [{site}] 授权成功。token: {token}")
 
             # 4. 🌟 释放并通关 proxy_sign_requests 队列记录
             # 通过主站兼容的 Method 吐回成功回执，触发网页前端的 await 阻塞瞬间放行，提示用户授权签署成功
-            await self.call('submitSignedTx', doc_id, {
-                "status": "authorized", 
-                "session_id": session_id
-            })
+            await self.call('replySignRequest', True, doc_id,
+                token)
             return
 
         except Exception as oauth_err:
             error_msg = f"授权背书签名或 RPC 推送发生故障: {str(oauth_err)}"
             print(f"x [OAuth/扫码授权失败]: {error_msg}")
             # 安全拒绝单子，防止前端无限打转挂起
-            await self.call('rejectSignRequest', doc_id, error_msg)
+            await self.call('replySignRequest', False, doc_id, error_msg)
             return
 
     def _check_fee_doc(self, op_types: list) -> tuple[bool, str]:
@@ -247,10 +257,10 @@ class SignBots(BTSBots):
             native_pubkey_object = ec.EllipticCurvePublicKey.from_encoded_point(
                 ec.SECP256R1(), public_key_bytes
             )
-        
+
             # 2. 处理签名格式
             signature_bytes = unhexlify(signature_hex)
-            
+
             # P-256 的 Raw 签名长度必须是 64 字节
             if len(signature_bytes) == 64:
                 r = int.from_bytes(signature_bytes[:32], byteorder='big')
@@ -259,7 +269,7 @@ class SignBots(BTSBots):
                 der_signature = encode_dss_signature(r, s)
             else:
                 raise ValueError("Invalid signature length")
-        
+
             # 3. 执行验证（使用转换后的 der_signature）
             message_bytes = tx_string.encode('utf-8')
             native_pubkey_object.verify(
@@ -269,7 +279,7 @@ class SignBots(BTSBots):
             )
             is_valid = True
             # print("签名验证成功")
-        
+
         except Exception as crypto_err:
             print(f"x [风控警告]: 签名验证异常! 明细: {crypto_err}")
             is_valid = False
@@ -309,11 +319,11 @@ class SignBots(BTSBots):
             # 限价单检查市场白名单
             sell_symbol = str(params["sell_asset"]).upper().strip()
             recv_symbol = str(params["receive_asset"]).upper().strip()
-            
+
             market_pair_forward = f"{sell_symbol}/{recv_symbol}"
             market_pair_reversed = f"{recv_symbol}/{sell_symbol}"
             whitelist_matches = [m.upper().strip() for m in self.config.get("market_whitelist", [])]
-            
+
             if (market_pair_forward not in whitelist_matches) and (market_pair_reversed not in whitelist_matches):
                 return False, f"交易对 {market_pair_forward} 不在交易对白名单范围内。"
 
@@ -350,7 +360,7 @@ class SignBots(BTSBots):
                     SELECT sell_amount, receive_amount FROM successful_orders
                     WHERE account_id = ? AND sell_asset_symbol = ? AND receive_asset_symbol = ? AND timestamp >= ?
                 """, (account_id, recv_symbol, sell_symbol, cutoff_time))
-                
+
                 historical_trades = cursor.fetchall()
                 if not historical_trades: continue
 
@@ -358,7 +368,7 @@ class SignBots(BTSBots):
                     historical_rate = float(hist_recv) / float(hist_sell)
                     # Arbitrage Equation: Total Swap Coefficient A = Proposed * Past_Inversed
                     arbitrage_coefficient = proposed_rate * historical_rate
-                    
+
                     if arbitrage_coefficient < lower_bound:
                         print(f"x [风控警告] 该下单违反了【{label}】时段的历史价格波动偏离约束！"
                               f"计算出的套利回报系数为 {arbitrage_coefficient:.4f}，"

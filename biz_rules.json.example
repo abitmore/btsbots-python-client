@@ -1,0 +1,14 @@
+{ 
+    "description": "BTSBots 登录与支付调用规则",
+    "updated_at": "2026-08-12 19:54:52",
+    "_comment1": "可支持多网站，定义不同网站的回调地址",
+    "oauth_endpoint":{
+        "example.com": "https://example.com/api/v1/oauth/verify",
+        "link.coolguy.vip": "https://link.coolguy.vip/biz-proxy/sync-login"
+    },
+    "_comment2": "支持多网站，memo开头匹配到exa_就调用这个地址",
+    "pay_endpoint":{
+        "exa_": "https://example.com/api/v1/payment/checkout"
+    }
+}
+

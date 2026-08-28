@@ -1,5 +1,5 @@
 { 
-    "description": "BitShares 核心 ID 与本位币定价风控策略（集成精度转换）",
+    "description": "BTSBots 账号与资产定价风控策略",
     "updated_at": "2026-08-12 19:54:52",
     "fee_limit": 10,
     "authorized_keys": [

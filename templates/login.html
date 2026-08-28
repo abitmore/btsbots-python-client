@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>安全登录认证网关</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f5f7fa; margin: 0; }
+        .login-container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; max-width: 360px; width: 100%; }
+        .qrcode-box { margin: 25px auto; width: 200px; height: 200px; background: #f8fafc; display: flex; justify-content: center; align-items: center; border: 1px solid #e2e8f0; padding: 10px; border-radius: 8px; }
+        .qrcode-box canvas, .qrcode-box img { width: 100% !important; height: 100% !important; }
+        .btn-link { display: inline-block; width: 100%; padding: 12px 0; background: #007bff; color: white; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 15px; box-sizing: border-box; }
+        .btn-link:hover { background: #0056b3; }
+        .tips { color: #64748b; font-size: 14px; margin-top: 10px; }
+        .ip-badge { background: #e2e8f0; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px; color: #334155; }
+    </style>
+</head>
+<body>
+
+<div class="login-container">
+    <h2>BitShares 安全登录</h2>
+    <p class="tips">您的当前网络 IP: <span class="ip-badge">__CLIENT_IP__</span></p>
+    
+    <!-- 方式一：二维码区域 -->
+    <div id="qrcode" class="qrcode-box"></div>
+    <p class="tips">使用 sign_bots 手机钱包扫码登录</p>
+    
+    <div style="margin: 20px 0; color: #cbd5e1;">──────── 或 ────────</div>
+    
+    <!-- 方式二：直接点击跳转 -->
+    <a href="__OAUTH_URL__" class="btn-link">直接点击跳转登录</a>
+</div>
+
+<!-- 🌟 核心占位符 1：Python 启动时会在这里把 qrcode.min.js 的源码原封不动吐出来 -->
+<script>
+__INLINE_QRCODE_JS__
+</script>
+
+<!-- 核心占位符 2：业务轮询与渲染脚本 -->
+<script>
+    // 1. 获取来自 Python 的真实注入参数（保持你的替换占位符不变）
+    const token = "__TOKEN__";
+    const appId = "__APP_ID__";
+    const clientIp = "__CLIENT_IP__";
+
+    console.log("🚀 [安全认证网关启动] 正在初始化轮询链路... 目标 Token: " + token);
+
+    let retryCount = 0;
+    const MAX_RETRIES = 150; // 2秒一次，最多连环盘查 5 分钟
+
+    function pollLoginStatus(token, appId) {
+        if (retryCount >= MAX_RETRIES) {
+            console.warn("🛑 轮询超时，本次登录二维码已过期，请刷新页面");
+            return;
+        }
+
+        // 🌟 绿色通道：通过专属直连路径发起 fetch 轰炸，Nginx 绝对不会再对它发起 302 劫持！
+        fetch(`/biz-proxy/callback?token=${token}&app_id=${appId}`)
+            .then(response => {
+                // 🌟 精准卡死：只要手机端一扫码签名且 sync-login 同步成功，Python 就会直接吐回 200 OK！
+                if (response.ok) {
+                    console.log("🎉 [验证成功] 手机端已成功签名且同步对齐！正在进入 Linkding 首页...");
+
+                    // 🔒 终极防线：用 location.replace 强制刷新浏览器地址栏历史，冲进干净的根路径
+                    window.location.replace("https://__SITE__");
+                } else {
+                    // ⏳ 如果后端丢回的是 401/403/400（代表用户还在扫码或者还在签名同步中）
+                    // 只要没有成功，老老实实带着【当前这一串一模一样的真 Token】继续发起下一轮轰炸！
+                    retryCount++;
+                    setTimeout(() => {
+                        pollLoginStatus(token, appId);
+                    }, 2000);
+                }
+            })
+            .catch(err => {
+                console.error("❌ 网络通信链路出现震荡，5秒后自动恢复挂起轮询...", err);
+                // 网络偶尔卡顿，也必须死死锁定真 Token 参数，隔 5 秒后继续坚守盘查！
+                setTimeout(() => {
+                    pollLoginStatus(token, appId);
+                }, 5000);
+            });
+    }
+    document.addEventListener("DOMContentLoaded", function () {
+
+        // 1. 打印调试：看看到底是谁占用了 QRCode 这个名字
+        console.log("=== 正在检查 QRCode 库的真实来源 ===");
+        console.log("QRCode 构造函数内容：", QRCode ? QRCode.toString() : "未定义");
+
+        const container = document.getElementById("qrcode");
+        const oauthUrl = "__OAUTH_QRCODE__";
+        const token = "__TOKEN__";
+        const appId = "__APP_ID__";
+        const clientIp = "__CLIENT_IP__";
+
+
+
+        // 2. 检查绑定的 HTML 节点是否存在
+        if (!container) {
+            console.error("❌ 错误：在页面上找不到 id 为 'qrcode' 的 <div> 标签，请检查 HTML！");
+            return;
+        }
+
+        // 3. 执行安全的初始化
+        try {
+            new QRCode(container, {
+                text: oauthUrl,
+                width: 200,
+                height: 200,
+                colorDark : "#0f172a",
+                colorLight : "#ffffff"
+            });
+            console.log("✅ 二维码渲染指令已成功发出");
+        } catch (error) {
+            console.error("❌ 渲染时依然触发了错误：", error);
+
+            // 💡 绝招：如果它真的是个假冒的库，尝试用它的“底层备用语法”直接传参测试
+            console.log("⚠️ 尝试使用备用单参数语法重试...");
+            container.innerHTML = ""; // 清空
+            try {
+                new QRCode(container, oauthUrl); 
+                console.log("🔄 使用备用语法成功渲染！");
+            } catch(e) {
+                console.error("❌ 备用语法也失败了", e);
+            }
+        }
+        // 启动 2 秒一次的静默安全轮询
+        pollLoginStatus(token, appId);
+    });
+    
+</script>
+
+</body>
+</html>

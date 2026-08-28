@@ -138,7 +138,7 @@ class PrivateKey:
         self._raw_priv = private_key_bytes
         self._sk = ecdsa.SigningKey.from_string(self._raw_priv, curve=ecdsa.SECP256k1)
         self._vk = self._sk.verifying_key
-        
+
         pub_bytes = self._vk.to_string()
         x_bytes = pub_bytes[:32]
         y_bytes = pub_bytes[32:]
@@ -212,6 +212,9 @@ class PrivateKey:
 def verify_message(message, signature, bts_pubkey_str, hashfn=hashlib.sha256):
     if not isinstance(message, bytes):
         message = bytes(message, "utf-8")
+    if isinstance(signature, str):
+        # 如果是 Hex 字符串，自动转换为 bytes
+        signature = unhexlify(signature.strip())
     if not isinstance(signature, bytes):  # pragma: no cover
         signature = bytes(signature, "utf-8")
     if not isinstance(message, bytes):

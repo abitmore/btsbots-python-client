@@ -30,7 +30,7 @@ class BotsClient(MeteorDDPClient):
     async def run(self):
         await super().run()
         args = self.args
-        try: 
+        try:
             await self._login(args.bypass_auth)
         except Exception as err:
             print(f"登陆失败: {err}")
@@ -48,21 +48,22 @@ class BotsClient(MeteorDDPClient):
             self.account_name = sys.stdin.readline().strip()
             self.active_key.ingest_from_stdin("请输入active WIF Key: ")
             self.memo_key.ingest_from_stdin("请输入memo WIF Key: ")
-        
+
         auth_payload = self._generate_auth_payload(self.account_name, 'btsbots.com')
         login_res = await self.call("login", {"btsWallet": auth_payload})
         self.user_id = login_res.get("id")
         _, self.bts_id = await self.get_account_brief(self.account_name)
         print(f"✓ [BotsClient] 登录成功！分配的 Session 用户 ID: {self.user_id}")
 
-    def _generate_auth_payload(self, account_name: str, site: str="btsbots.com", session: str="") -> dict:
+    def _generate_auth_payload(self, account_name: str, site: str="btsbots.com", token: str="", ip: str="") -> dict:
         import time
         import json
 
         auth_data = {
-            "account": account_name,
+            "username": account_name,
             "site": site,
-            "session": session,
+            "ip": ip,
+            "token": token,
             "time": int(time.time())
         }
         message_str = json.dumps(auth_data, sort_keys=True)
@@ -76,7 +77,7 @@ class BotsClient(MeteorDDPClient):
         """【接口】为当前登录会话申请一个 6 位数字的网页前端一次性登录码 (OTP)"""
         if not self.user_id:
             raise PermissionError("未登录会话，无法申请网页 2FA 令牌")
-            
+
         print("[BotsClient] 正在向 DDP 核心申请临时 Web OTP 验证码...")
         otp_token = await self.call("generateWebOtp")
         return str(otp_token)
@@ -85,7 +86,7 @@ class BotsClient(MeteorDDPClient):
         """【接口】模拟普通用户前端：不携带任何私钥，凭一次性 OTP 令牌完成会话登录认证"""
         self.account_name = account_name
         print(f"[BotsClient] 正在尝试提交临时 OTP 凭证锁定 Web 会话...")
-        
+
         login_msg = {
             "otp": {
                 "account": account_name,
@@ -146,7 +147,7 @@ class BotsClient(MeteorDDPClient):
         info = self._get_account_local(account_symbol_or_id)
         if info: return info
         info = await self._get_account_remote(account_symbol_or_id)
-        if info: 
+        if info:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("INSERT OR REPLACE INTO cached_accounts VALUES (?, ?, ?)", (info['u'], info['_id'], json.dumps(info)))
             return info
@@ -185,7 +186,7 @@ class BotsClient(MeteorDDPClient):
         info = self._get_asset_local(asset_symbol_or_id)
         if info: return info
         info = await self._get_asset_remote(asset_symbol_or_id)
-        if info: 
+        if info:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("INSERT OR REPLACE INTO cached_assets VALUES (?, ?, ?)", (info['a'], info['_id'], json.dumps(info)))
             return info
@@ -213,7 +214,7 @@ class BotsClient(MeteorDDPClient):
         info = self._get_memo_local(memo_id)
         if info: return info
         info = await self._get_memo_remote(memo_id)
-        if info: 
+        if info:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("INSERT OR REPLACE INTO cached_memo VALUES (?, ?)", (int(info['_id']), json.dumps(info)))
             return info
