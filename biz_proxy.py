@@ -226,6 +226,7 @@ def oauth_callback(
     token: str = Query(..., description="主站回调带回的Token"),
     redirect: str = Query("/", description="最终要跳回的业务页面") # 默认回首页
 ):
+    session_max_age = 86400 * 30
     if not token:
         raise HTTPException(status_code=401, detail="缺少有效凭证")
 
@@ -245,7 +246,7 @@ def oauth_callback(
 
     # 颁发长效 Session ID
     real_session_id = f"sess_{uuid.uuid4().hex}"
-    expires_at = int(time.time()) + 86400 * 30
+    expires_at = int(time.time()) + session_max_age
 
     AUTH_CACHE[real_session_id] = {
         "username": bts_username,
@@ -262,7 +263,7 @@ def oauth_callback(
         content="Login verified. Redirecting..."
     )
 
-    res.set_cookie(key="bts_session", value=real_session_id, path="/", max_age=86400, httponly=True, secure=True, samesite="lax")
+    res.set_cookie(key="bts_session", value=real_session_id, path="/", max_age=session_max_age, httponly=True, secure=True, samesite="lax")
     return res
 
 
@@ -284,6 +285,7 @@ def check_login(
 
     if not final_session_id or not final_app_id:
         raise HTTPException(status_code=401, detail="缺少有效会话ID")
+        #return Response(headers={"X-User": ""}, status_code=200, content="GUEST_ALLOW")
 
     session_info = AUTH_CACHE.get(final_session_id)
 

@@ -8,26 +8,26 @@ from typing import Callable, Optional
 import argparse
 
 def generate_subscription_id(pub_name: str, params: list) -> str:
-    """Generates a stable, unique 16-character hexadecimal DDP Subscription ID 
+    """Generates a stable, unique 16-character hexadecimal DDP Subscription ID
     based on the subscription name and its parameters.
     """
     import hashlib
     # 1. Ensure parameters are evaluated consistently by ordering keys in dictionaries
     # (Fixes the issue where {'a': 1, 'b': 2} hashes differently than {'b': 2, 'a': 1})
     serialized_params = json.dumps(params, sort_keys=True)
-    
+
     # 2. Combine the publication name and serialized arguments into a single string payload
     payload = f"{pub_name}::{serialized_params}"
-    
+
     # 3. Create an MD5 hash of the payload (encoded to UTF-8 bytes)
     hasher = hashlib.md5(payload.encode('utf-8'))
-    
+
     # 4. Return the hex digest. We slice it to 16 characters for a cleaner DDP message string.
     return hasher.hexdigest()[:16]
 
 class MeteorDDPClient:
-    def __init__(self, url: str):
-        self.url: str = url 
+    def __init__(self):
+        self.url = ""
         self.ws: Optional[websockets.WebSocketClientStream] = None
         self.on_data_changed: Optional[Callable[[str, str, str, dict], None]] = None
         self._pending_responses = {}
@@ -36,7 +36,7 @@ class MeteorDDPClient:
         self.collections: dict[str, dict[str, dict]] = {}
         self.description = "meteor ddp client"
 
-        self.subscriptions = {}   
+        self.subscriptions = {}
         self.login_token = None      # 缓存服务端回传的长期登录令牌
         self._next_id = 1            # DDP 消息序号计数器
         self.args = None
@@ -60,7 +60,7 @@ class MeteorDDPClient:
         parser.add_argument(
             "--url",
             type=str,
-            default="wss://btsbots.com/websocket",
+            default="wss://ws.btsbots.com/websocket",
             help="Meteor DDP websocket URL",
         )
         # 允许子类扩展特定参数
@@ -75,18 +75,18 @@ class MeteorDDPClient:
         try:
             print(f"[*] 正在连接 Meteor 节点: {self.url}")
             self.ws = await ws_connect(self.url)
-            
+
             # DDP 协议握手帧
             await self.ws.send('{"msg": "connect", "version": "1", "support": ["1"]}')
             connected_response = await self.ws.recv()
             print("🔌[DDP 协议] 连接已激活。")
- 
+
             # 判定是【断线恢复】还是【首次登录】
             if self.login_token:
                 print(f"🔄[恢复会话] 检测到本地持有令牌，正在恢复会话...")
                 resume_payload = {
                     "msg": "method",
-                    "method": "login", 
+                    "method": "login",
                     "params": [{"resume": self.login_token}],
                     "id": f"resume_{self._next_id}"
                 }
@@ -95,18 +95,18 @@ class MeteorDDPClient:
                 print("🎉[恢复成功] 成功通过 resume 令牌登录！")
             else:
                 print("🔑[等待登陆] 未登陆，等待认证...")
- 
+
             # 重新激活所有数据订阅通道
             for sub_id, sub_info in self.subscriptions.items():
                 sub_name = sub_info["name"]
                 sub_params = sub_info["params"]
                 print(f"🔄[数据重载] 正在恢复订阅: {sub_name} | 参数: {sub_params}")
-                
+
                 sub_payload = {
                     "msg": "sub",
-                    "id": sub_id, 
+                    "id": sub_id,
                     "name": sub_name,
-                    "params": sub_params 
+                    "params": sub_params
                 }
                 await self.ws.send(json.dumps(sub_payload))
             # Start background transport loop
@@ -131,7 +131,7 @@ class MeteorDDPClient:
         }
         await self.ws.send(json.dumps(payload))
         response_data = await future
-        
+
         if (method_name == "nodeSessionLogin" or method_name == "login") and response_data:
             server_token = response_data.get("token") or response_data.get("result", {}).get("token")
             if server_token:
@@ -239,11 +239,11 @@ class MeteorDDPClient:
             "params": [],
             "id": "exit-logout-id-999" # randomID
         }
-        
+
         try:
             print("正在注销令牌 ...")
-            await self.ws.send(json.dumps(logout_raw_msg)) 
-            await asyncio.sleep(0.2) 
+            await self.ws.send(json.dumps(logout_raw_msg))
+            await asyncio.sleep(0.2)
         except Exception as e:
             print(f"发送注销请求失败（可能连接已断开）: {e}")
         finally:

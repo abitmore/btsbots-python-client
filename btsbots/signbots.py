@@ -8,8 +8,8 @@ import asyncio
 from btsbots.btsbots import BTSBots
 
 class SignBots(BTSBots):
-    def __init__(self, ddp_endpoint: str, db_path: str = "bots.sqlite", config_path: str = "security_rules.json"):
-        super().__init__(ddp_endpoint, db_path)
+    def __init__(self, db_path: str = "bots.sqlite", config_path: str = "security_rules.json"):
+        super().__init__(db_path)
         self.config_path = config_path
         self.seen_signatures = set()
         self.last_config_mtime: float = 0.0

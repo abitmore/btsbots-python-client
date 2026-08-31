@@ -30,7 +30,7 @@ def sign_data(private_key_object, text_data: str) -> str:
     s_bytes = s.to_bytes(32, byteorder='big')
     raw_signature_bytes = r_bytes + s_bytes
     signature_hex = hexlify(raw_signature_bytes).decode('utf-8')
-    
+
     return signature_hex
 
 async def generate_string_signed_envelope(op_type: str, params: dict, wif: str) -> dict:
@@ -43,17 +43,17 @@ async def generate_string_signed_envelope(op_type: str, params: dict, wif: str) 
         format=serialization.PublicFormat.UncompressedPoint
     )
     pubkey_hex = hexlify(pub_bytes).decode('utf-8')
-    
+
     raw_intent_object = {
         "type": op_type,
         "client_time": int(time.time()),
         "params": params
     }
-    
+
     tx_payload_string = json.dumps(raw_intent_object, sort_keys=True, separators=(',', ':'))
-    
+
     signature_hex = sign_data(private_key, tx_payload_string)
-    
+
     return {
         "tx_string": tx_payload_string,
         "browser_pubkey": pubkey_hex,
@@ -61,13 +61,13 @@ async def generate_string_signed_envelope(op_type: str, params: dict, wif: str) 
     }
 
 async def main():
-    client = SignBots("wss://btsbots.com/websocket")
+    client = SignBots()
     print(f"[*] Authenticating account via secure WIF handshake...")
     await client.run()
 
     AUTHORIZED_BROWSER_WIF = "5JrrH48Mumd2xymt3aiezKX1QcV3LDaCYuYFGa8tsaSDsaNwAJ8"
     UNAUTHORIZED_BROWSER_WIF = "5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3"
-    
+
     test_suite = [
         {
             "id": "CASE_01_REJECT_UNAUTHORIZED_KEY",
@@ -108,14 +108,14 @@ async def main():
     for idx, run_meta in enumerate(test_suite, 1):
         case_id = run_meta["id"]
         print(f"\n🚀 [{idx}/{len(test_suite)}] Processing evaluation target: {case_id}")
-        
+
         if case_id == "CASE_05_REJECT_REPLAY_ATTACK":
             envelope = cached_envelopes["CASE_04_ACCEPT_VALID_SELL_ORDER"]
             print("   [!] Injecting identical duplicate raw string buffer payload to trigger replay protection...")
         else:
             envelope = await generate_string_signed_envelope(run_meta["type"], run_meta["params"], run_meta["wif"])
             cached_envelopes[case_id] = envelope
-            
+
         try:
             tx_id = await client.submit_proxy_sign_request(envelope)
             print(f"   🎉 [Test Result] Success! Passed through firewall and signed on-chain: {tx_id}")

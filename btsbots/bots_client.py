@@ -8,8 +8,8 @@ from btsbots.bots_key import BotsKey
 import argparse
 
 class BotsClient(MeteorDDPClient):
-    def __init__(self, ddp_endpoint: str, db_path: str = "bots.sqlite"):
-        super().__init__(ddp_endpoint)
+    def __init__(self, db_path: str = "bots.sqlite"):
+        super().__init__()
         self.db_path = db_path
         self._init_db_cache()
         self.account_name: Optional[str] = None

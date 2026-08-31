@@ -2,7 +2,7 @@ import asyncio
 from btsbots.signbots import SignBots
 
 async def main():
-    bot = SignBots("wss://btsbots.com/websocket")
+    bot = SignBots()
     try:
         await bot.run()
 

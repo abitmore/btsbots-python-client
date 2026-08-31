@@ -22,7 +22,7 @@ class TestOtpLogin(BotsClient):
     async def run(self):
         await MeteorDDPClient.run(self)
         args = self.args
-        try: 
+        try:
             await self.login_with_otp(args.user, args.otp)
         except Exception as err:
             print(f"登陆失败: {err}")
@@ -30,7 +30,7 @@ class TestOtpLogin(BotsClient):
 
 async def main():
 
-    client = TestOtpLogin("wss://btsbots.com/websocket")
+    client = TestOtpLogin()
     try:
         await client.run()
 

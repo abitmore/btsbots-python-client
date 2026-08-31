@@ -10,8 +10,8 @@ def get_domain(url):
     return re.sub(r'^(https?://)?([^/]+).*$', r'\2', url)
 
 class BizBots(BTSBots):
-    def __init__(self, ddp_endpoint: str, db_path: str = "bots.sqlite", config_path: str = "biz_rules.json"):
-        super().__init__(ddp_endpoint, db_path)
+    def __init__(self, db_path: str = "bots.sqlite", config_path: str = "biz_rules.json"):
+        super().__init__(db_path)
         self.config_path = config_path
         self.last_config_mtime: float = 0.0
         self.oauth_endpoint = {}
@@ -107,8 +107,8 @@ class BizBots(BTSBots):
             }
             payload = self.active_key.sign_message(json.dumps(post_data))
             for pattern in self.pay_endpoint:
-                if tx_id.startswith(pattern):
-                    response = requests.post(self.pay_endpoint, json=payload, timeout=5)
+                if memo_str.startswith(pattern):
+                    response = requests.post(self.pay_endpoint[pattern], json=payload, timeout=5)
                     if response.status_code == 200:
                         print(f"✅ [支付成功]: 网站已成功收到账单通知，网页端即将放行！")
                         return True
@@ -163,7 +163,7 @@ class BizBots(BTSBots):
             await self.call('SubmitOauthLoginRequest', doc_id, status)
 
 async def main():
-    bot = BizBots("wss://btsbots.com/websocket")
+    bot = BizBots()
     try:
         await bot.run()
 
