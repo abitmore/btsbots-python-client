@@ -353,7 +353,12 @@ class SignBots(BTSBots):
         fee_limit = self.config.get("fee_limit", 10)
         for index in op_types:
             item = fee_doc[index]
-            fee = int(item[1].get("fee")) / 10**5
+            if index == 5:
+                fee = (item[1].get("basic_fee") + 0.1*item[1].get("price_per_kbyte")) / 10**5
+            elif index == 0:
+                fee = (item[1].get("fee") + 0.1*item[1].get("price_per_kbyte")) / 10**5
+            else:
+                fee = int(item[1].get("fee")) / 10**5
             if fee > fee_limit:
                 return False, f"交易费用 {fee} BTS，超过风控限制 ({fee_limit} BTS)"
         return True, ""

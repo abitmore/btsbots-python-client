@@ -111,8 +111,8 @@ class BTSBots(BotsClient):
             return block_num
         except Exception as broadcast_err:
             print(f"  [!] 交易被节点拒绝，错误明细: {broadcast_err}")
-            import traceback
-            traceback.print_exc()
+            #import traceback
+            #traceback.print_exc()
             raise
 
     async def _build_op(self, uid: str, raw_op: dict) -> list:
