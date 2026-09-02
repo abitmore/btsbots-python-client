@@ -1,11 +1,10 @@
-from typing import Optional
+from typing import Optional, Tuple, Any
 import json
 import sqlite3
 import sys
 
 from btsbots.meteor_client import MeteorDDPClient
 from btsbots.bots_key import BotsKey
-import argparse
 
 class BotsClient(MeteorDDPClient):
     def __init__(self, db_path: str = "bots.sqlite"):
@@ -15,8 +14,10 @@ class BotsClient(MeteorDDPClient):
         self.account_name: Optional[str] = None
         self.user_id: Optional[str] = None
         self.bts_id: Optional[str] = None
-        self.active_key = BotsKey()
-        self.memo_key = BotsKey()
+
+        # 统一维持一个智能多 Key 密钥管理器 (不再区分 active_key / memo_key)
+        self.key_manager = BotsKey()
+
         self.description = "BTSBots client"
 
     def extend_arguments(self, parser):
@@ -24,30 +25,36 @@ class BotsClient(MeteorDDPClient):
             "--pass",
             dest="bypass_auth",
             type=str,
-            help="Bypass interactive credentials",
+            help="Bypass interactive credentials using pass entry",
+        )
+        parser.add_argument(
+            "--keyfile",
+            type=str,
+            help="Load credentials directly from a local generated account credential file",
         )
 
     async def run(self):
         await super().run()
         args = self.args
         try:
-            await self._login(args.bypass_auth)
+            await self._login(args.bypass_auth, args.keyfile)
         except Exception as err:
             print(f"登陆失败: {err}")
             await self.close()
             raise
 
-    async def _login(self, passPath=""):
-        """使用私钥执行去中心化登录"""
-        """需要先给botskey导入私钥"""
-        if passPath:
-            self.account_name = self.active_key.ingest_from_pass(passPath)
-            self.memo_key.ingest_from_pass(passPath, 3)
+    async def _login(self, passPath="", keyfile=""):
+        """使用统一的密钥管理器执行去中心化登录"""
+        if keyfile:
+            print(f"[*] 正在从本地凭证文件加载账号与多重密钥: {keyfile}")
+            self.account_name = self.key_manager.ingest_from_file(keyfile)
+        elif passPath:
+            self.account_name = self.key_manager.ingest_from_pass(passPath)
         else:
             print("请输入用户名: ", end="", flush=True)
             self.account_name = sys.stdin.readline().strip()
-            self.active_key.ingest_from_stdin("请输入active WIF Key: ")
-            self.memo_key.ingest_from_stdin("请输入memo WIF Key: ")
+            print("请依次输入您的 WIF Keys (支持输入多把，输入空行结束):")
+            self.key_manager.ingest_from_stdin()
 
         auth_payload = self._generate_auth_payload(self.account_name, 'btsbots.com')
         login_res = await self.call("login", {"btsWallet": auth_payload})
@@ -67,7 +74,8 @@ class BotsClient(MeteorDDPClient):
             "time": int(time.time())
         }
         message_str = json.dumps(auth_data, sort_keys=True)
-        payload = self.active_key.sign_message(message_str)
+        # 使用统一的 key_manager 签名
+        payload = self.key_manager.sign_message(message_str)
         return {
             "user": account_name,
             "verify": payload
@@ -100,7 +108,6 @@ class BotsClient(MeteorDDPClient):
         return login_res
 
     def _init_db_cache(self):
-        """Initializes localized tracking datasets inside SQLite storage."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cached_assets (
@@ -132,10 +139,8 @@ class BotsClient(MeteorDDPClient):
         if is_id:
             raw_num = int(account_symbol_or_id.split(".")[-1])
             meteor_doc = await self.call("get_account_document_by_id", raw_num)
-            print(f"🔍 [SQLite 未命中] 正在通过服务器读取用户 ID 资料: 1.2.{raw_num} ...")
         else:
             meteor_doc = await self.call("get_account_document_by_symbol", account_symbol_or_id)
-            print(f"🔍 [SQLite 未命中] 正在通过服务器读取用户 ID 资料: {account_symbol_or_id} ...")
         if meteor_doc:
             _symbol = str(meteor_doc['u']).strip()
             _id = f"1.2.{meteor_doc['_id']}"
@@ -171,10 +176,8 @@ class BotsClient(MeteorDDPClient):
         if is_id:
             raw_num = int(asset_symbol_or_id.split(".")[-1])
             meteor_doc = await self.call("get_asset_document_by_id", raw_num)
-            print(f"🔍 [SQLite 未命中] 正在通过服务器读取资产信息: 1.3.{raw_num} ...")
         else:
             meteor_doc = await self.call("get_asset_document_by_symbol", asset_symbol_or_id)
-            print(f"🔍 [SQLite 未命中] 正在通过服务器读取资产信息: {asset_symbol_or_id} ...")
         if meteor_doc:
             _symbol = str(meteor_doc['a']).upper().strip()
             _id = f"1.3.{meteor_doc['_id']}"
@@ -196,26 +199,3 @@ class BotsClient(MeteorDDPClient):
         info = await self.get_asset_info(asset_symbol_or_id)
         if info: return info['a'], info['_id'], info['p']
         return None, None, None
-
-    def _get_memo_local(self, memo_id: int) -> dict:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(f"SELECT raw_data FROM cached_memo WHERE id = ?", (memo_id,)).fetchone()
-            if row: return json.loads(row[0])
-        return None
-
-    async def _get_memo_remote(self, memo_id: int) -> dict:
-        print(f"🔍 [SQLite 未命中] 正在通过服务器读取memo信息: {memo_id} ...")
-        meteor_doc = await self.call("get_memo", memo_id)
-        if meteor_doc:
-            return meteor_doc
-        return None
-
-    async def get_memo(self, memo_id: int) -> dict:
-        info = self._get_memo_local(memo_id)
-        if info: return info
-        info = await self._get_memo_remote(memo_id)
-        if info:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("INSERT OR REPLACE INTO cached_memo VALUES (?, ?)", (int(info['_id']), json.dumps(info)))
-            return info
-        raise ValueError(f"无法获取memo信息: {memo_id}")

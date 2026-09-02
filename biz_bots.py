@@ -6,7 +6,6 @@ from btsbots.btsbots import BTSBots
 import re
 
 def get_domain(url):
-    # 匹配 https://、http:// 或直接开始，直到遇到第一个斜杠或结尾
     return re.sub(r'^(https?://)?([^/]+).*$', r'\2', url)
 
 class BizBots(BTSBots):
@@ -64,7 +63,6 @@ class BizBots(BTSBots):
             if collection == 'login_requests' and action == 'added':
                 asyncio.create_task(self._verify_and_sign_oauth(doc_id, fields))
             elif collection == 'transfer' and action == 'added':
-                # print(doc_id, fields)
                 asyncio.create_task(self._verify_and_sign_pay(doc_id, fields))
 
         self.on_data_changed = _on_queue_income
@@ -84,7 +82,6 @@ class BizBots(BTSBots):
             else:
                 delta_time = time.time() - fields.get('T')
 
-            # 只检查5分钟内的新到付款
             if delta_time > 60*5:
                 return
             users = fields.get('u')
@@ -92,11 +89,12 @@ class BizBots(BTSBots):
                 return
             if not fields.get('m'):
                 return
-            # transfer 的 doc_id 为什么有个 ~ 符号？？
+
             tx_id = int(doc_id[1:])
             memo = await self.get_memo(tx_id)
-            memo_str = self.memo_key.decrypt_memo(memo)
-            #print("debug", memo_str)
+            # 使用统一的 key_manager 解密 memo
+            memo_str = self.key_manager.decrypt_memo(memo)
+
             post_data = {
                 "type": "payment",
                 "time": int(time.time()),
@@ -105,7 +103,8 @@ class BizBots(BTSBots):
                 "amount": fields.get('b'),
                 "asset": fields.get('a')
             }
-            payload = self.active_key.sign_message(json.dumps(post_data))
+            # 使用统一的 key_manager 签名消息
+            payload = self.key_manager.sign_message(json.dumps(post_data))
             for pattern in self.pay_endpoint:
                 if memo_str.startswith(pattern):
                     response = requests.post(self.pay_endpoint[pattern], json=payload, timeout=5)
@@ -129,7 +128,8 @@ class BizBots(BTSBots):
         try:
             verify = fields.get("verify")
             print(fields)
-            if not self.active_key.verify_message(verify):
+            # 使用统一的 key_manager 验证消息签名
+            if not self.key_manager.verify_message(verify):
                 print(f"x [授权失败]: 签名错误")
                 return
             raw_payload = json.loads(verify.get("data"))
@@ -147,9 +147,12 @@ class BizBots(BTSBots):
                 print(f"x [授权失败]: token 超时 {timeout} 秒")
                 return
 
-            print(f"✅[检查通过]: 用户{raw_payload.get("username")}取得{domain}合法授权")
+            print(f"✅[检查通过]: 用户{raw_payload.get('username')}取得{domain}合法授权")
             print(f"📡 [等待登陆]: 正在通知商户网站...")
-            payload = self.active_key.sign_message(verify.get("data"))
+            # 使用统一的 key_manager 签名消息
+            payload = self.key_manager.sign_transaction if hasattr(self.key_manager, 'sign_message') else self.key_manager.sign_message(verify.get("data"))
+            # 修正为正确的签名调用
+            payload = self.key_manager.sign_message(verify.get("data"))
             response = requests.post(self.oauth_endpoint[domain], json=payload, timeout=5)
 
             if response.status_code == 200:

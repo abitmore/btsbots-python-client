@@ -1,36 +1,28 @@
 from btsbots.bots_client import BotsClient
 
 class BTSBots(BotsClient):
-    #def __init__(self, ddp_endpoint: str, db_path: str = "bots.sqlite"):
-    #    super().__init__(ddp_endpoint, db_path)
-
     async def run(self, passPath=""):
         await super().run()
         # 最新区块信息
-        # update in collections "global_properties"
         await self.subscribe("chainBlockHeadStream")
         # 手续费
-        # update in collections "global"
         await self.subscribe("chainGlobalProperties")
 
     async def make_transaction(self, raw_ops: list[dict], isSim: bool=False) -> int:
         """
         接受交易请求格式如下:
         {"type": xx, "params": xx}
-        其中type可以为 "limit_order_create/limit_order_cancel/transfer"
-        params 格式如下:
-        {"to_account": "xxx", "asset": "BTS", "amount": 0.1, "memo": "test", "simulate": True}
-        {"sell_asset": "BTS", "amount": 1.0, "receive_asset": "USD", "price": 5, "simulate": True}
+        其中type可以为 "limit_order_create/limit_order_cancel/transfer/account_create"
         """
         try:
-            # 1. build operations 
+            # 1. build operations
             ops = []
             for raw_op in raw_ops:
                 op = await self._build_op(self.bts_id, raw_op)
                 ops.append(op)
             # 2. fill fees
             self._fill_ops_fee(ops)
-            # 3. sign and  broadcast
+            # 3. sign and broadcast
             block = await self._sign_and_broadcast(ops, isSim)
             return block
         except Exception as e:
@@ -43,9 +35,9 @@ class BTSBots(BotsClient):
         block_head_coll = self.collections.get("global_properties")
         if not block_head_coll:
             raise KeyError("本地内存中暂未接收到同步的高度状态数据。")
-            
+
         block_doc = next(iter(block_head_coll.values()))
-        head_block_num = int(block_doc.get("B", 0))       
+        head_block_num = int(block_doc.get("B", 0))
         head_block_id_hex = str(block_doc.get("id", "")).strip()
 
         ref_block_num = head_block_num & 0xFFFF
@@ -57,9 +49,8 @@ class BTSBots(BotsClient):
         block_head_coll = self.collections.get("global_properties", {})
         if not block_head_coll:
             raise KeyError("本地内存中暂未接收到同步的高度状态数据。")
-            
+
         block_doc = next(iter(block_head_coll.values()))
-        # mongo中的timedate对象，被meteor推送来的是毫秒时间戳
         block_time = block_doc["T"]["$date"] / 1000
         return block_time
 
@@ -68,32 +59,32 @@ class BTSBots(BotsClient):
         if not global_coll:
             raise KeyError("本地内存中暂未接收到同步的费率数据。")
         global_doc = next((doc for doc in global_coll.values() if doc.get("id") == "2.0.0"))
-        fee_doc= global_doc["parameters"].get("current_fees", {}).get("parameters", [])
+        fee_doc = global_doc["parameters"].get("current_fees", {}).get("parameters", [])
 
         for op in ops:
             self._fill_op_fee(op, fee_doc)
 
     def _fill_op_fee(self, op: list, fee_doc: dict):
         from binascii import unhexlify
-        import math
         op_code = op[0]
         item = fee_doc[op[0]]
-        calculated_fee = int(item[1].get("fee"))
+        if op_code == 5:
+            calculated_fee = int(item[1].get("basic_fee"))
+            total_bytes = 143 + len((op[1]["name"]).encode('utf-8'))
+            calculated_fee += total_bytes * item[1].get("price_per_kbyte") // 1024
+        else:
+            calculated_fee = int(item[1].get("fee"))
         if op_code == 0 and op[1].get("memo"):
             cipher_bytes_len = len(unhexlify(op[1]["memo"]["message"]))
-            # 还原 fc::raw::pack_size(memo) 的字节数累加
-            # 33(from) + 33(to) + 8(nonce) + 1(长度标记) + 密文长度
-            #varint_len = 1 if cipher_bytes_len < 128 else 2
             varint_len = 2
             total_bytes = 33 + 33 + 8 + varint_len + cipher_bytes_len
             calculated_fee += total_bytes * item[1].get("price_per_kbyte") // 1024
-        op[1]["fee"]["amount"] = calculated_fee 
+        op[1]["fee"]["amount"] = calculated_fee
 
     async def _sign_and_broadcast(self, ops: list, isSim: bool=False) -> int:
         from datetime import datetime
         try:
             ref_block_num, ref_block_prefix = self._get_ref_block_info()
-            # 从区块链获取时间，防止本地时间不准交易无法发送
             block_time = self._get_chain_time()
             dt = datetime.fromtimestamp(block_time+30)
             expiration = dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -102,20 +93,20 @@ class BTSBots(BotsClient):
                 "ref_block_prefix": int(ref_block_prefix),
                 "expiration": expiration,
                 "operations": ops
-                }
-            
-            finalized_tx_json = self.active_key.sign_transaction(payload)
+            }
 
-            # 投递广播
+            # 使用统一的 key_manager 签名交易
+            finalized_tx_json = self.key_manager.sign_transaction(payload)
+
             if isSim:
                 result = {"status": "SUCCESS", "blockNum": 1644}
             else:
                 result = await self.call("broadcastTransaction", finalized_tx_json)
             if(result["status"] == "FAIL"):
-                print(f"  交易广播失败：{result["message"]}")
-                raise RuntimeError(f"  交易广播失败：{result["message"]}")
+                print(f"  交易广播失败：{result['message']}")
+                raise RuntimeError(f"  交易广播失败：{result['message']}")
             block_num = result["blockNum"]
-            
+
             print(f"  发送成功，交易区块号: {block_num}")
             return block_num
         except Exception as broadcast_err:
@@ -135,9 +126,11 @@ class BTSBots(BotsClient):
             _op = await self._build_op_limit_order_create(uid, op_params)
         elif op_type == "limit_order_cancel":
             _op = await self._build_op_limit_order_cancel(uid, op_params)
+        elif op_type == "account_create":
+            _op = await self._build_op_account_create(uid, op_params)
 
         if _op is None:
-            raise RuntimeError(f"未支持的交易类型{op_type}")
+            raise RuntimeError(f"未支持的交易类型 {op_type}")
         return _op
 
     async def _build_op_transfer(self, uid: str, op_params: dict) -> list:
@@ -203,12 +196,46 @@ class BTSBots(BotsClient):
         }
         return [2, cancel_payload]
 
+    async def _build_op_account_create(self, uid: str, op_params: dict) -> list:
+        """实现 BitShares 账号注册 (opcode 5: account_create)"""
+        account_create_payload = {
+            "fee": {"amount": 0, "asset_id": "1.3.0"},
+            "registrar": str(uid),
+            "referrer": str(uid),
+            "referrer_percent": 10000,
+            "name": op_params["name"],
+            "owner": {
+                "weight_threshold": 1,
+                "account_auths": [],
+                "key_auths": [[op_params["owner_key"], 1]],
+                "address_auths": []
+            },
+            "active": {
+                "weight_threshold": 1,
+                "account_auths": [],
+                "key_auths": [[op_params["active_key"], 1]],
+                "address_auths": []
+            },
+            "options": {
+                "memo_key": op_params["memo_key"],
+                "voting_account": "1.2.0",
+                "num_witness": 0,
+                "num_committee": 0,
+                "votes": []
+            },
+            "extensions": []
+        }
+        return [5, account_create_payload]
+
     async def encrypt_memo(self, op_params: dict):
-        if not self.memo_key :
-            raise ValueError("Need import memo key first")
+        if not self.key_manager:
+            raise ValueError("Need import keys first")
         _info = await self.get_account_info(op_params.get("to_account"))
         payload = {
             "to": _info['k']['m'],
-            "message": op_params["memo"]
+            "message": op_params["memo"],
+            "my_memo_pub": _info.get('k', {}).get('m')
         }
-        return self.memo_key.encrypt_memo(payload)
+        # 使用统一的 key_manager 加密 memo
+        return self.key_manager.encrypt_memo(payload)
+

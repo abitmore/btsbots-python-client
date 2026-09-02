@@ -3,6 +3,7 @@ import struct
 import hashlib
 import ecdsa
 import base58
+import os
 from binascii import hexlify, unhexlify
 
 from cryptography.hazmat.primitives.asymmetric import ec

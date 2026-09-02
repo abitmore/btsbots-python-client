@@ -1,0 +1,58 @@
+{
+    "description": "BTSBots Account and Asset Pricing Risk Control Strategy",
+    "updated_at": "2026-09-01 21:25:00",
+    "fee_limit": 10,
+    "__comment_fee": "比特股单笔交易手续费熔断上限(单位:BTS)，防止高油费恶意攻击",
+
+    "public_keys": {
+        "c266a5528a64d93184e1f59ab65ee325bfe3f919cf6fe93xxx": "pc-market",
+        "439fe4d668aeee57cdf904f379fde0618c482c0ea099a1fxxx": "Aphone-market",
+        "db87c899a44b3197c5174c8c0d097fda8decf208e357407xxx": "Aphone-wallet",
+        "d02396d17e7846bad306ff80bb97d0f7a6386d53f0b0aeaxxx": "Bphone",
+        "d0febcee240bfa2e47d5da1cc96830b7c39303af7713f25xxx": "Cphone"
+    },
+    "__comment_keys": "Web Crypto生成的设备公钥与本地别名映射表，用于身份识别",
+
+    "oauth_allowed_devices":[ "Aphone-wallet", "B-phone" ],
+    "__comment_oauth": "允许执行动态OTP登录及第三方应用授权的高权限设备",
+
+    "trading_risk": {
+        "authorized_devices": [ "Aphone-market", "pc-market" ],
+        "__comment_trading_devices": "仅允许这两台设备提交签名请求来挂单、撤单、交易",
+        
+        "volatility_limit_1h": 0.97,
+        "volatility_limit_1d": 0.95,
+        "volatility_limit_1w": 0.90,
+        "__comment_volatility": "离群值偏离度保护: 卖单价/近期历史买单价(或 近期历史卖单价/买单价) 必须大于该阈值，防止手抖或网页被控对倒刷单",
+        
+        "market_whitelist": [
+            "CNY/USD", "CNY/BTS", "BTS/USD"
+        ],
+        "__comment_whitelist": "交易对白名单。非白名单市场的交易请求 sign-bots 将拒绝签名"
+    },
+
+    "unlimited_payments": {
+        "authorized_devices": [ "Aphone-wallet", "Bphone" ],
+        "recipient_whitelist": {
+            "angel": "1.2.1000",
+            "dan": "1.2.2000"
+        },
+        "__comment_unlimited": "大额不限额转账策略: 必须由高级设备发起，且收款人必须在内嵌的官方白名单账户中，无法转给陌生人"
+    },
+
+    "micro_payments": {
+        "base_limits": {
+            "CNY": 50,
+            "USD": 10,
+            "BTS": 1000
+        },
+        "__comment_limits": "各币种的单笔基础额度。日常调整只需修改此处的资产定价",
+
+        "device_rules": {
+            "Cphone": { "single_multiplier": 0.6, "day_max_multiplier": 1, "week_max_multiplier": 7, "pin": 1664 },
+            "Bphone": { "single_multiplier": 2.0, "day_max_multiplier": 12, "week_max_multiplier": 50, "pin": "" },
+            "Aphone-wallet": { "single_multiplier": 20.0, "day_max_multiplier": 100, "week_max_multiplier": 500, "pin": 133557 }
+        },
+        "__comment_device_rules": "设备阶梯风控: 分别为(/单笔/天累计/周累计)额度倍数的限制。20CNY就是0.4额度，5USD又加上0.5的额度就是累计0.9"
+    }
+}

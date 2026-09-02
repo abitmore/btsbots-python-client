@@ -2,10 +2,11 @@ import os
 import json
 import time
 import sqlite3
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional, Callable
 import asyncio
 
 from btsbots.btsbots import BTSBots
+from btsbots.utils import validate_bts_username
 
 class SignBots(BTSBots):
     def __init__(self, db_path: str = "bots.sqlite", config_path: str = "security_rules.json"):
@@ -16,7 +17,6 @@ class SignBots(BTSBots):
         self._init_db_order()
 
     def _init_db_order(self):
-        """Initializes localized tracking datasets inside SQLite storage."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS successful_orders (
@@ -25,41 +25,79 @@ class SignBots(BTSBots):
                     receive_asset_symbol TEXT NOT NULL, receive_amount INTEGER NOT NULL, timestamp INTEGER NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS successful_transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    device_alias TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    timestamp INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    account_name TEXT,
+                    device_alias TEXT,
+                    op_type TEXT,
+                    status TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    raw_summary TEXT
+                )
+            """)
             conn.commit()
 
-    async def hot_reload_config_file(self, force: bool = False):
+    def _log_audit(self, account_name: str, device_alias: str, op_type: str, status: str, detail: str, raw_summary: dict = None):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO audit_logs (timestamp, account_name, device_alias, op_type, status, detail, raw_summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(time.time()),
+                        account_name or "Unknown",
+                        device_alias or "Unidentified",
+                        op_type or "unknown",
+                        status,
+                        detail,
+                        json.dumps(raw_summary, ensure_ascii=False) if raw_summary else "{}"
+                    )
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"⚠️ [审计日志写入异常]: {e}")
+
+    async def hot_reload_config_file(self, force: bool = False) -> bool:
         try:
             if not os.path.exists(self.config_path):
                 raise FileNotFoundError(f"Missing mandatory policy file: {self.config_path}")
 
             current_mtime = os.path.getmtime(self.config_path)
             if not force and (current_mtime <= self.last_config_mtime):
-                return
+                return False
 
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 self.config = json.load(f)
             print(f"🔄 配置文件加载成功。规则版本更新时间: {self.config.get('updated_at')}")
             self.last_config_mtime = current_mtime
+            return True
         except Exception as err:
-            print(f"配置文件解析发生异常: {str(err)}")
+            print(f"❌ 配置文件解析发生异常: {str(err)}")
+            return False
 
     async def hot_reload_strategy(self, force: bool = False):
-        """【安全策略加载接口】加载规则集，并核对白名单用户名与区块链账户 ID 是否对应"""
         try:
             if not await self.hot_reload_config_file(force):
                 return
-
-            user_whitelist = self.config.get("user_whitelist", {})
+            unlimited_cfg = self.config.get("unlimited_payments", {})
+            user_whitelist = unlimited_cfg.get("recipient_whitelist", {})
             for username, claimed_id in list(user_whitelist.items()):
-                _, _id, = await self.get_account_brief(username)
-                if _id:
-                    if _id != claimed_id:
-                        print(f"🚨[风控警告] 账号{username} 服务端ID {_id} 与 '{claimed_id}' 不匹配！忽略此账号。")
-                        del self.config["user_whitelist"][username]
-                else:
-                    print(f"🚨[风控警告] 账号{claimed_id} 信息获取失败，忽略此账号。")
+                _, _id = await self.get_account_brief(username)
+                if _id and _id != claimed_id:
+                    print(f"🚨 [风控警告] 账号 {username} 服务端ID {_id} 与配置的 '{claimed_id}' 不匹配！")
         except Exception as err:
-            print(f"策略风控解析过程发生异常错误: {str(err)}")
+            print(f"❌ 策略风控解析异常: {str(err)}")
 
     async def submit_proxy_sign_request(self, signed_envelope: dict) -> str:
         tx_id = await self.call("requestProxySign", signed_envelope)
@@ -71,61 +109,187 @@ class SignBots(BTSBots):
             asyncio.create_task(self.hot_reload_strategy())
             if collection == 'proxy_sign_requests' and action == 'added':
                 asyncio.create_task(self._audit_and_sign_worker(doc_id, fields, on_broadcast_success))
+            elif collection == 'account_registrations' and action == 'added':
+                asyncio.create_task(self._process_account_registration(doc_id, fields))
 
         self.on_data_changed = _on_queue_income
         await self.subscribe("allPendingSignRequests")
-        print("⚡[BTSBots] 零信任安全守卫，签名网关，正在监听中...")
+        await self.subscribe("pendingAccountRegistrations", [self.account_name])
+        print("⚡ [BTSBots 签名网关] 零信任安全守卫与邀请注册监听器已全面启动...\n")
+
+    async def _process_account_registration(self, doc_id: str, fields: dict):
+        new_account_name = fields.get("newAccountName")
+        keys = fields.get("keys", {})
+        registrar = fields.get("registrar")
+
+        if registrar != self.account_name:
+            return
+
+        print(f"\n────────────────────────────────────────────────────────────")
+        print(f"👤 [收到新用户注册申请]")
+        print(f"   - 申请用户名: {new_account_name}")
+        print(f"   - 使用邀请码: {fields.get('code')}")
+
+        try:
+            is_valid, err_msg = validate_bts_username(new_account_name)
+            if not is_valid:
+                raise ValueError(f"用户名不合规: {err_msg}")
+
+            owner_key = keys.get("owner")
+            active_key = keys.get("active")
+            memo_key = keys.get("memo")
+
+            raw_op = {
+                "type": "account_create",
+                "params": {
+                    "name": new_account_name,
+                    "owner_key": owner_key,
+                    "active_key": active_key,
+                    "memo_key": memo_key
+                }
+            }
+
+            print(f"   🚀 正在代为向链上广播注册交易 (推荐人与注册人自动设为: {self.account_name})...")
+            block_num = await self.make_transaction([raw_op], isSim=False)
+
+            print(f"   ✅ 注册成功！已写入区块链，区块号: {block_num}")
+            print(f"────────────────────────────────────────────────────────────\n")
+
+            await self.call("resolveAccountRegistration", doc_id, True, f"Block: {block_num}")
+
+        except Exception as err:
+            error_msg = str(err)
+            print(f"   ❌ 注册代办失败: {error_msg}")
+            print(f"────────────────────────────────────────────────────────────\n")
+            await self.call("resolveAccountRegistration", doc_id, False, error_msg)
+
+    def _format_readable_summary(self, op_type: str, params: dict) -> tuple[str, dict]:
+        summary_desc = ""
+        human_data = {}
+
+        if op_type == "transfer":
+            to_acc = params.get("to_account")
+            amount = params.get("amount")
+            asset = params.get("asset")
+            memo = params.get("memo", "")
+            summary_desc = f"向账户 [{to_acc}] 转账 {amount} {asset}" + (f" (附言: {memo})" if memo else "")
+            human_data = {"目标账户": to_acc, "金额": f"{amount} {asset}", "附言": memo}
+
+        elif op_type == "limit_order_create":
+            sell_amt = params.get("amount")
+            sell_ast = params.get("sell_asset")
+            recv_ast = params.get("receive_asset")
+            price = params.get("price")
+            summary_desc = f"挂单出售 {sell_amt} {sell_ast}，换取 {recv_ast}，单价: {price}"
+            human_data = {"出售": f"{sell_amt} {sell_ast}", "购买资产": recv_ast, "价格": price}
+
+        elif op_type == "limit_order_cancel":
+            order_id = params.get("order_id")
+            summary_desc = f"撤销限价订单 [ID: {order_id}]"
+            human_data = {"订单ID": order_id}
+
+        elif op_type == "oauth_login":
+            site = params.get("site")
+            client_id = params.get("client_id")
+            summary_desc = f"授权登录第三方网站 [{site}] (客户端ID: {client_id})"
+            human_data = {"目标网站": site, "商户ID": client_id}
+        else:
+            summary_desc = f"执行未知操作类型: {op_type}"
+            human_data = params
+
+        return summary_desc, human_data
 
     async def _audit_and_sign_worker(self, doc_id: str, fields: dict, success_callback: Optional[Callable]):
         envelope = fields.get("rawTx", {})
-        # 1. 检测公钥是否授权，签名是否合格
-        is_valid_crypto, crypto_msg = self._verify_browser_envelope(envelope)
+        account_name = fields.get("account", "Unknown")
+        authenticated_sender_id = fields.get("account_id")
+
+        is_valid_crypto, device_alias, crypto_msg = self._verify_browser_envelope(envelope)
+
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"────────────────────────────────────────────────────────────")
+        print(f"📥 [收到签名请求] 时间: {time_str}")
+        print(f"   👤 请求账号: {account_name} (ID: {authenticated_sender_id})")
+        print(f"   💻 请求设备: {device_alias or '未识别设备'}")
+
         if not is_valid_crypto:
-            print(f"x [风控拦截]: {crypto_msg}")
+            print(f"   ❌ 状态结果: 【拦截拒绝】")
+            print(f"   🚨 拒绝原因: {crypto_msg}")
+            print(f"────────────────────────────────────────────────────────────\n")
+            self._log_audit(account_name, device_alias, "unknown", "REJECTED", crypto_msg)
             await self.call('replySignRequest', False, doc_id, f"{crypto_msg}")
             return
 
         raw_payload = json.loads(envelope.get("tx_string", "{}"))
-
-        op_type = raw_payload.get("type")
+        op_type = raw_payload.get("type", "unknown")
         op_params = raw_payload.get("params", {})
-        authenticated_sender_id = fields.get("account_id")
-        account_name = fields.get("account") # 获取当前用户的比特股账号名
+        pin_code_provided = op_params.get("pin")
 
-        # 处理第三方商户的授权登录（OAuth/扫码）请求
+        readable_desc, readable_data = self._format_readable_summary(op_type, op_params)
+        print(f"   📋 操作摘要: {readable_desc}")
+
         if op_type == "oauth_login":
+            oauth_devices = self.config.get("oauth_allowed_devices", [])
+            if device_alias not in oauth_devices:
+                reason = f"设备 [{device_alias}] 无权执行 OAuth 授权登录"
+                print(f"   ❌ 状态结果: 【拦截拒绝】")
+                print(f"   🚨 拒绝原因: {reason}")
+                print(f"────────────────────────────────────────────────────────────\n")
+                self._log_audit(account_name, device_alias, op_type, "REJECTED", reason, readable_data)
+                await self.call('replySignRequest', False, doc_id, reason)
+                return
+
+            print(f"   ✅ 状态结果: 【审核通过 - 准备执行 OAuth 授权】")
+            print(f"────────────────────────────────────────────────────────────\n")
+            self._log_audit(account_name, device_alias, op_type, "APPROVED", "OAuth 授权成功", readable_data)
             await self.oauth_handle(doc_id, fields)
             return
 
-        # 2. 检查 fee 是否超过限制
-        is_safe, msg = self._check_fee_doc([0,1,2])
+        is_safe, fee_msg = self._check_fee_doc([0, 1, 2, 5])
         if not is_safe:
-            print(f"x [风控拦截]: {msg}")
-            await self.call('replySignRequest', False, doc_id, f"{msg}")
+            print(f"   ❌ 状态结果: 【拦截拒绝】")
+            print(f"   🚨 拒绝原因: {fee_msg}")
+            print(f"────────────────────────────────────────────────────────────\n")
+            self._log_audit(account_name, device_alias, op_type, "REJECTED", fee_msg, readable_data)
+            await self.call('replySignRequest', False, doc_id, fee_msg)
             return
 
-        # 3. 检查转账或者下单是否合规
-        #print("debug", op_type, op_params, authenticated_sender_id)
-        is_safe, status_msg = await self._audit_security_strategy(
-            op_type, op_params, authenticated_sender_id
+        is_safe, status_msg, require_pin, pin_error = await self._audit_security_strategy(
+            op_type, op_params, authenticated_sender_id, device_alias, pin_code_provided
         )
-        if not is_safe:
-            print(f"x [审核拦截]: {status_msg}")
-            await self.call('replySignRequest', False, doc_id, f"{status_msg}")
-            return
-        else:
-            print(f"✓ [审核通过]: {status_msg}")
-            print(f"  签名交易: {op_params}")
 
-        # 4. 打包签名发送
+        if require_pin:
+            print(f"   ⚠️ 状态结果: 【触发 PIN 码验证】")
+            print(f"   🔒 提示信息: {status_msg}")
+            print(f"────────────────────────────────────────────────────────────\n")
+            self._log_audit(account_name, device_alias, op_type, "REQUIRE_PIN", status_msg, readable_data)
+            await self.call('replySignRequest', False, doc_id, {"requirePin": True, "message": status_msg})
+            return
+
+        if not is_safe:
+            print(f"   ❌ 状态结果: 【审核拦截】")
+            print(f"   🚨 拒绝原因: {status_msg}")
+            print(f"────────────────────────────────────────────────────────────\n")
+            self._log_audit(account_name, device_alias, op_type, "REJECTED", status_msg, readable_data)
+            await self.call('replySignRequest', False, doc_id, status_msg)
+            return
+
+        print(f"   ✅ 状态结果: 【审核通过 - 正在链上签名广播】")
+        print(f"────────────────────────────────────────────────────────────\n")
+
         try:
-            is_sim = op_params.get("simulate")
+            is_sim = op_params.get("simulate", False)
             block_num = await self.make_transaction([raw_payload], is_sim)
-            await self.call('replySignRequest', True, doc_id,
-                block_num)
+
+            self._log_audit(account_name, device_alias, op_type, "SUCCESS", f"交易已成功打包，区块号: {block_num}", readable_data)
+
+            if op_type == "transfer":
+                self._log_successful_transfer(authenticated_sender_id, device_alias, op_params.get("asset"), float(op_params.get("amount")))
+
+            await self.call('replySignRequest', True, doc_id, block_num)
             if success_callback:
                 success_callback(doc_id, block_num)
-            # The transaction has cleared the blockchain validation layer! Log details natively into your SQL tables
+
             if op_type == "limit_order_create":
                 self._log_successful_transaction(
                     block_num=block_num,
@@ -134,76 +298,49 @@ class SignBots(BTSBots):
                     params=op_params
                 )
         except Exception as e:
-            print(f"🚨[网关异常] {e}")
-            #import traceback
-            #traceback.print_exc()
-            await self.call('replySignRequest', False, doc_id, f"网关异常中断: {str(e)}")
+            error_reason = f"网关异常中断: {str(e)}"
+            print(f"🚨 [广播失败] {error_reason}")
+            self._log_audit(account_name, device_alias, op_type, "ERROR", error_reason, readable_data)
+            await self.call('replySignRequest', False, doc_id, error_reason)
 
     async def oauth_handle(self, doc_id: str, fields: dict):
-        """
-        专门处理第三方商户的 OAuth / 扫码授权登录验证
-        """
-        print(fields)
         envelope = fields.get("rawTx", {})
-        account_name = fields.get("account")
         clientIp = fields.get("clientIp")
 
         raw_payload = json.loads(envelope.get("tx_string", "{}"))
-
         op_params = raw_payload.get("params", {})
 
-        print(f"🔐 [OAuth/扫码授权]: 收到用户 [{account_name}] 对商户的身份授权登录请求...")
-
-        # 1. 审查第三方商户参数
-        client_id = op_params.get("client_id")      # 提取商户的用户名 / 标识符
-        token = op_params.get("token")    # 提取商户出具的临时会话挑战码
-        site = op_params.get("site")    # 提取商户出具的临时会话挑战码
-        ip = op_params.get("ip")    # 提取商户出具的临时会话挑战码
+        client_id = op_params.get("client_id")
+        token = op_params.get("token")
+        site = op_params.get("site")
+        ip = op_params.get("ip")
 
         if not client_id or not token or not site or not ip:
             msg = "授权登录参数不完整"
-            print(f"x [授权风控拦截]: {msg}")
             await self.call('replySignRequest', False, doc_id, msg)
             return
 
         if clientIp != ip:
             msg = "BTSBots client 与商户 client IP 地址不符合"
-            print(f"x [授权风控拦截]: {msg}")
             await self.call('replySignRequest', False, doc_id, msg)
             return
 
         try:
-
-            # python_blockchain_sig = Your_BitShares_Sign_Logic(browser_pubkey)
             auth_payload = self._generate_auth_payload(self.account_name, site, token, ip)
-
-            # 3. 组装准备推送到商户监控队列的完整的安全授权凭证包
             final_payload = {
                 "client_id": str(client_id).lower().strip(),
                 "verify": auth_payload.get("verify")
             }
 
-            # =================================================================
-            # 🎯 核心动作二：【通过 RPC 推送至 Meteor 服务端商家监控队列】
-            # 调用钱包站服务端特有的 RPC 方法，由钱包核心服务器将数据安全写入 `login_requests` 集合
-            # 供商户的 Python 机器人在后台抓取并进行最终的免信任密码学交叉核对
-            # =================================================================
-            print(f"📡 正在通过 RPC 向 Meteor 服务器推送授权凭证...")
-            # 假设你在 Meteor 端注册的推送 Method 名字叫 'pushAuthToMerchantQueue'
+            print(f"📡 正在通过 RPC 向 Meteor 服务器推送授权凭证到商户端...")
             await self.call('pushAuthToMerchantQueue', final_payload)
+            print(f"✅ [OAuth 登录成功] 站点 [{site}] 已获得授权。")
 
-            print(f"✅ [OAuth/扫码授权]: 登录站点 [{site}] 授权成功。token: {token}")
-
-            # 4. 🌟 释放并通关 proxy_sign_requests 队列记录
-            # 通过主站兼容的 Method 吐回成功回执，触发网页前端的 await 阻塞瞬间放行，提示用户授权签署成功
-            await self.call('replySignRequest', True, doc_id,
-                token)
+            await self.call('replySignRequest', True, doc_id, token)
             return
-
         except Exception as oauth_err:
             error_msg = f"授权背书签名或 RPC 推送发生故障: {str(oauth_err)}"
-            print(f"x [OAuth/扫码授权失败]: {error_msg}")
-            # 安全拒绝单子，防止前端无限打转挂起
+            print(f"❌ [OAuth 授权失败]: {error_msg}")
             await self.call('replySignRequest', False, doc_id, error_msg)
             return
 
@@ -212,20 +349,16 @@ class SignBots(BTSBots):
         if not global_coll:
             raise KeyError("本地内存中暂未接收到同步的费率数据。")
         global_doc = next((doc for doc in global_coll.values() if doc.get("id") == "2.0.0"))
-        fee_doc= global_doc["parameters"].get("current_fees", {}).get("parameters", [])
+        fee_doc = global_doc["parameters"].get("current_fees", {}).get("parameters", [])
+        fee_limit = self.config.get("fee_limit", 10)
         for index in op_types:
             item = fee_doc[index]
             fee = int(item[1].get("fee")) / 10**5
-            if fee > self.config["fee_limit"]:
-                return False, f"交易费用{fee}BTS, 超过限制: {self.config['fee_limit']}"
-        return True,""
+            if fee > fee_limit:
+                return False, f"交易费用 {fee} BTS，超过风控限制 ({fee_limit} BTS)"
+        return True, ""
 
-    def _verify_browser_envelope(self, envelope: dict) -> tuple[bool, str]:
-        """
-        【安全网络核验接口 - 授权公钥白名单】
-        白名单里只存公钥的 50 位 SHA-256 哈希串。
-        前端发送完整的 130 位公钥过来，后端计算哈希比对通过后，再用完整公钥验签。
-        """
+    def _verify_browser_envelope(self, envelope: dict) -> tuple[bool, Optional[str], str]:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes
         from binascii import unhexlify
@@ -235,155 +368,154 @@ class SignBots(BTSBots):
         import time
 
         tx_string = envelope.get("tx_string")
-        pubkey_hex = envelope.get("browser_pubkey")  # 前端传过来的完整 130 位原始公钥
+        pubkey_hex = envelope.get("browser_pubkey")
         signature_hex = envelope.get("browser_sig")
 
         if not tx_string or not pubkey_hex or not signature_hex:
-            return False, "解包失败：缺少标准 Web Crypto 鉴权参数。"
+            return False, None, "解包失败：缺少标准 Web Crypto 鉴权参数。"
 
         try:
-            # 计算 130 位完整公钥的标准 SHA-256 哈希值
-            # 截取前 50 个字符作为特征指纹
             hasher = hashlib.sha256()
             hasher.update(pubkey_hex.lower().encode('utf-8'))
             computed_fingerprint_50 = hasher.hexdigest()[:50]
 
-            # 匹配公钥白名单
-            if computed_fingerprint_50 not in self.config["authorized_keys"]:
-                return False, f"该公钥未授权，如需签名请加入白名单: {computed_fingerprint_50}"
+            public_keys_map = self.config.get("public_keys", {})
+            if computed_fingerprint_50 not in public_keys_map:
+                return False, None, f"未授权的设备公钥指纹: {computed_fingerprint_50}"
 
-            # 1. 还原公钥
+            device_alias = public_keys_map[computed_fingerprint_50]
+
             public_key_bytes = unhexlify(pubkey_hex)
             native_pubkey_object = ec.EllipticCurvePublicKey.from_encoded_point(
                 ec.SECP256R1(), public_key_bytes
             )
 
-            # 2. 处理签名格式
             signature_bytes = unhexlify(signature_hex)
-
-            # P-256 的 Raw 签名长度必须是 64 字节
             if len(signature_bytes) == 64:
                 r = int.from_bytes(signature_bytes[:32], byteorder='big')
                 s = int.from_bytes(signature_bytes[32:], byteorder='big')
-                # 将 r 和 s 编码为 Python 预期的 ASN.1 DER 格式
                 der_signature = encode_dss_signature(r, s)
             else:
-                raise ValueError("Invalid signature length")
+                return False, device_alias, "无效的签名数据长度"
 
-            # 3. 执行验证（使用转换后的 der_signature）
-            message_bytes = tx_string.encode('utf-8')
             native_pubkey_object.verify(
-                der_signature,  # 注意：这里换成 DER 格式
-                message_bytes,
+                der_signature,
+                tx_string.encode('utf-8'),
                 ec.ECDSA(hashes.SHA256())
             )
-            is_valid = True
-            # print("签名验证成功")
-
         except Exception as crypto_err:
-            print(f"x [风控警告]: 签名验证异常! 明细: {crypto_err}")
-            is_valid = False
+            return False, None, f"密码学签名验证异常: {crypto_err}"
 
-        if not is_valid:
-            return False, "签名验证失败。"
-
-        # 时钟同步与防重放安全审查
         try:
             raw_payload = json.loads(tx_string)
         except Exception:
-            return False, "无法识别交易"
+            return False, None, "无法解析交易内容 JSON"
 
-        if abs(int(time.time()) - raw_payload.get("client_time", 0)) > 10:
-            return False, "交易已过期"
+        if abs(int(time.time()) - raw_payload.get("client_time", 0)) > 30:
+            return False, device_alias, "交易请求已超时过期"
 
         if signature_hex in self.seen_signatures:
-            return False, "重复的交易请求."
+            return False, device_alias, "检测到重放攻击：重复的交易请求"
         self.seen_signatures.add(signature_hex)
 
-        return True, "签名请求可信，已验证通过"
+        return True, device_alias, "签名可信"
 
-    async def _audit_security_strategy(self, op_type: str, params: dict, sender_id: str) -> Tuple[bool, str]:
+    async def _audit_security_strategy(self, op_type: str, params: dict, sender_id: str, device_alias: str, pin_code_provided: Optional[str]) -> Tuple[bool, str, bool, str]:
         try:
-            # 转账检查收款方白名单
             if op_type == "transfer":
-                to_account_name = params.get("to_account")
-                if to_account_name not in self.config["user_whitelist"]:
-                    return False, f"收款账号 [{to_account_name}] 不在白名单，取消转账."
+                unlimited_cfg = self.config.get("unlimited_payments", {})
+                authorized_devices = unlimited_cfg.get("authorized_devices", [])
+                recipient_whitelist = unlimited_cfg.get("recipient_whitelist", {})
 
-                return True, "可安全转账"
+                to_account_name = params.get("to_account")
+
+                if device_alias in authorized_devices and to_account_name in recipient_whitelist:
+                    return True, "大额白名单转账策略校验通过", False, ""
+
+                micro_cfg = self.config.get("micro_payments", {})
+                base_limits = micro_cfg.get("base_limits", {})
+                device_rules = micro_cfg.get("device_rules", {})
+
+                if device_alias not in device_rules:
+                    return False, f"设备 [{device_alias}] 不在小额支付允许的设备列表中", False, ""
+
+                dev_rule = device_rules[device_alias]
+                asset = params.get("asset", "").upper().strip()
+                amount = float(params.get("amount", 0))
+
+                base_limit = base_limits.get(asset, 0)
+                if base_limit == 0:
+                    return False, f"资产 [{asset}] 未配置小额支付基准额度", False, ""
+
+                single_limit = base_limit * dev_rule.get("single_multiplier", 0)
+                day_limit = base_limit * dev_rule.get("day_max_multiplier", 0)
+                week_limit = base_limit * dev_rule.get("week_max_multiplier", 0)
+
+                if amount > single_limit:
+                    return False, f"转账金额 {amount} {asset} 超出单笔小额限额 ({single_limit})", False, ""
+
+                if not self._check_micro_payment_accumulated(sender_id, device_alias, asset, amount, day_limit, week_limit):
+                    return False, f"转账金额超出小额【天累计】或【周累计】限额", False, ""
+
+                required_pin = dev_rule.get("pin")
+                if required_pin is not None and str(required_pin) != "":
+                    if not pin_code_provided:
+                        return False, f"该小额转账操作安全级别较高，需要输入 PIN 码验证", True, ""
+                    elif str(pin_code_provided) != str(required_pin):
+                        return False, f"输入的 PIN 码错误，拒绝签名", False, "PIN码错误"
+
+                return True, "小额支付策略校验通过（含PIN验证）", False, ""
 
             if op_type == "limit_order_cancel":
-                order_object_id = str(params.get("order_id", ""))
-                return True, f"可取消限价单: {order_object_id}"
+                return True, "撤单安全策略校验通过", False, ""
 
-            # 限价单检查市场白名单
-            sell_symbol = str(params["sell_asset"]).upper().strip()
-            recv_symbol = str(params["receive_asset"]).upper().strip()
-
-            market_pair_forward = f"{sell_symbol}/{recv_symbol}"
-            market_pair_reversed = f"{recv_symbol}/{sell_symbol}"
-            whitelist_matches = [m.upper().strip() for m in self.config.get("market_whitelist", [])]
-
-            if (market_pair_forward not in whitelist_matches) and (market_pair_reversed not in whitelist_matches):
-                return False, f"交易对 {market_pair_forward} 不在交易对白名单范围内。"
-
-            # 限价单检查下单价格是否合理，防止被恶意低卖高买刷单盗窃
-            sell_amount = float(params["amount"])
-            recv_amount = float(params["amount"]) * float(params["price"])
-
-            if not self._check_profitability_bounds(sender_id, sell_symbol, sell_amount, recv_symbol, recv_amount):
-                return False, "该订单预期套利系数低于时间窗口内波动偏离下限！"
-
-            return True, "完全符合交易安全策略"
+            return True, "操作安全策略校验通过", False, ""
 
         except Exception as err:
-            return False, f"风控解析过程发生异常错误: {str(err)}"
+            return False, f"风控策略解析异常: {str(err)}", False, ""
 
-    # TODO, need test
-    def _check_profitability_bounds(self, account_id: str, sell_symbol: str, sell_amt: float, recv_symbol: str, recv_amt: float) -> bool:
-        """Enforces sliding multi-timeframe geometric rolling arbitrage restrictions."""
+    def _check_micro_payment_accumulated(self, account_id: str, device_alias: str, asset: str, current_amount: float, day_max: float, week_max: float) -> bool:
         now = int(time.time())
-        intervals = {
-            "一小时内": (now - 3600, float(self.config.get("volatility_limit_1h", 0.97))),
-            "一天内": (now - 86400, float(self.config.get("volatility_limit_1d", 0.95))),
-            "一周内": (now - 604800, float(self.config.get("volatility_limit_1w", 0.90)))
-        }
-
-        # Proposed swap rate multiplier: Tokens Received / Tokens Expended
-        proposed_rate = float(recv_amt) / float(sell_amt)
+        day_ago = now - 86400
+        week_ago = now - 604800
 
         with sqlite3.connect(self.db_path) as conn:
-            for label, (cutoff_time, lower_bound) in intervals.items():
-                # Locate historical transaction rows executing in the absolute reverse direction
-                # (e.g. Current Receive Asset matches past Expended Asset, and vice versa)
-                cursor = conn.execute("""
-                    SELECT sell_amount, receive_amount FROM successful_orders
-                    WHERE account_id = ? AND sell_asset_symbol = ? AND receive_asset_symbol = ? AND timestamp >= ?
-                """, (account_id, recv_symbol, sell_symbol, cutoff_time))
+            cursor_day = conn.execute("""
+                SELECT SUM(amount) FROM successful_transfers
+                WHERE account_id = ? AND device_alias = ? AND asset = ? AND timestamp >= ?
+            """, (account_id, device_alias, asset, day_ago))
+            day_sum = cursor_day.fetchone()[0] or 0.0
 
-                historical_trades = cursor.fetchall()
-                if not historical_trades: continue
+            if (day_sum + current_amount) > day_max:
+                return False
 
-                for hist_sell, hist_recv in historical_trades:
-                    historical_rate = float(hist_recv) / float(hist_sell)
-                    # Arbitrage Equation: Total Swap Coefficient A = Proposed * Past_Inversed
-                    arbitrage_coefficient = proposed_rate * historical_rate
+            cursor_week = conn.execute("""
+                SELECT SUM(amount) FROM successful_transfers
+                WHERE account_id = ? AND device_alias = ? AND asset = ? AND timestamp >= ?
+            """, (account_id, device_alias, asset, week_ago))
+            week_sum = cursor_week.fetchone()[0] or 0.0
 
-                    if arbitrage_coefficient < lower_bound:
-                        print(f"x [风控警告] 该下单违反了【{label}】时段的历史价格波动偏离约束！"
-                              f"计算出的套利回报系数为 {arbitrage_coefficient:.4f}，"
-                              f"低于用户设定的多时区最低底线容忍阈值 ({lower_bound})！拒绝签署私钥。")
-                        return False
+            if (week_sum + current_amount) > week_max:
+                return False
+
         return True
 
+    def _log_successful_transfer(self, account_id: str, device_alias: str, asset: str, amount: float):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO successful_transfers (account_id, device_alias, asset, amount, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (account_id, device_alias, asset.upper().strip(), amount, int(time.time()))
+            )
+            conn.commit()
+
     def _log_successful_transaction(self, block_num: str, account_id: str, op_type: str, params: dict):
+        if op_type != "limit_order_create":
+            return
         sell_symbol = str(params["sell_asset"]).upper().strip()
         recv_symbol = str(params["receive_asset"]).upper().strip()
-        # 限价单检查下单价格是否合理，防止被恶意低卖高买刷单盗窃
         sell_amount = float(params["amount"])
         recv_amount = float(params["amount"]) * float(params["price"])
-        """Saves verified mainnet transaction receipts natively into SQLite data fields."""
-        if op_type != "limit_order_create": return
+
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("INSERT OR REPLACE INTO successful_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
                 block_num, account_id, op_type,
