@@ -6,23 +6,44 @@ class InvitationTool(BotsClient):
     def extend_arguments(self, parser):
         super().extend_arguments(parser)
         parser.add_argument("--action", type=str, required=True, choices=["generate", "list"], help="操作类型: generate(生成) 或 list(查看)")
+        parser.add_argument("--count", type=int, default=1, help="批量生成的邀请码数量 (默认 1 个)")
 
     async def run(self):
         await super().run()
         args = self.args
         try:
+            print(f"[*] 正在核验账号 [{self.account_name}] 的 VIP 会员资格...")
+            account_info = await self.get_account_info(self.account_name)
+            is_vip = account_info.get("v", False)
+
             if args.action == "generate":
-                print(f"[*] 正在为账号 [{self.account_name}] 生成新的邀请码...")
-                code = await self.call("generateInvitation", self.account_name)
+                if not is_vip:
+                    print("==================================================")
+                    print(" ❌ 权限拒绝：您当前不是 VIP 用户（v: false）！")
+                    print(" 💡 提示：只有升级为 VIP 用户后才具备生成邀请码和代注册账户的资格。")
+                    print("==================================================")
+                    return
+
+                print(f"[*] 正在为 VIP 账号 [{self.account_name}] 批量生成 {args.count} 个邀请码...")
+                res = await self.call("generateInvitation", self.account_name, args.count)
+                
+                # 兼容防错：如果服务端返回的恰好是 string（防止历史旧版缓存），转为 dict 处理
+                if isinstance(res, str):
+                    res = {"codes": [res], "generated": 1, "message": "生成成功"}
+
                 print("==================================================")
-                print(f" ✨ 成功生成邀请码: {code}")
+                print(f" ✨ {res.get('message', '生成成功')} (成功生成 {res.get('generated', 1)} 个):")
                 print("==================================================")
+                for code in res.get("codes", []):
+                    print(f"  • {code}")
+                print("==================================================")
+
             elif args.action == "list":
                 print(f"[*] 正在通过 RPC 获取账号 [{self.account_name}] 的邀请码列表...")
                 invitations = await self.call("listInvitations", self.account_name)
-
+                
                 print("==================================================")
-                print(f" 📋 邀请码列表 (共 {len(invitations)} 个):")
+                print(f" 📋 邀请码列表 (共 {len(invitations)} 个) | VIP 状态: {'🟢 已激活' if is_vip else '🔴 未开通'}:")
                 print("==================================================")
                 for inv in invitations:
                     status = "🟢 已使用" if inv.get("status") == "used" else "🔵 未使用"
@@ -40,4 +61,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

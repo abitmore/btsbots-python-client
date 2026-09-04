@@ -5,6 +5,7 @@ import termios
 import subprocess
 import multiprocessing
 from functools import wraps
+from binascii import hexlify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from btsbots.graphene_light import PrivateKey
@@ -15,14 +16,14 @@ def sandbox_execute(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
         if not self._encrypted_key_store:
-            raise ValueError("No keys loaded. Please ingest a key first.")
+            raise ValueError("密钥库为空，请先导入 WIF 私钥。")
 
         parent_conn, child_conn = ctx.Pipe()
 
         def _child_worker():
             decrypted_store = {}
             try:
-                # 在子进程中解密所有的 WIF 密钥
+                # 在子进程安全沙盒中解密已保存的 WIF 密钥
                 for pub_addr, cipher in self._encrypted_key_store.items():
                     plain_bytes = self._decrypt(cipher)
                     decrypted_store[pub_addr] = plain_bytes
@@ -32,7 +33,7 @@ def sandbox_execute(func):
             except Exception as e:
                 child_conn.send({'status': 'error', 'message': str(e)})
             finally:
-                # 清除子进程内存明文
+                # 内存抹零保护
                 for k, v in decrypted_store.items():
                     if isinstance(v, bytearray):
                         for i in range(len(v)):
@@ -47,7 +48,7 @@ def sandbox_execute(func):
             process.join()
 
             if response.get('status') == 'error':
-                raise RuntimeError(f"Sandbox error in {func.__name__}: {response.get('message')}")
+                raise RuntimeError(f"沙盒执行异常 [{func.__name__}]: {response.get('message')}")
 
             return response.get('result')
         finally:
@@ -57,9 +58,9 @@ def sandbox_execute(func):
 
 class BotsKey:
     """
-    智能多 Key 管理器：
-    维护一个以公钥地址（如 BTS...）为索引的密钥字典，
-    常驻内存中仅存放加密后的 AES 密文。
+    智能多 Key 密钥管理器：
+    以标准 BitShares 公钥地址（如 BTS...）为索引，常驻内存仅保留 AES 密文。
+    所有操作强制指定目标公钥。
     """
     def __init__(self):
         self._memory_master_key = os.urandom(32)
@@ -84,6 +85,16 @@ class BotsKey:
         cipher = AES.new(self._memory_master_key, AES.MODE_CBC, iv)
         decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
         return bytearray(decrypted)
+
+    def has_key(self, pub_key: str) -> bool:
+        """检查指定公钥对应的私钥是否已加载"""
+        if not pub_key:
+            return False
+        return str(pub_key).strip() in self._encrypted_key_store
+
+    def get_available_pubkeys(self) -> list[str]:
+        """获取当前已成功导入的所有公钥列表"""
+        return list(self._encrypted_key_store.keys())
 
     def add_key_by_wif(self, wif_str: str) -> str:
         """解析 WIF 并在本地字典建立以公钥地址为索引的映射"""
@@ -132,7 +143,7 @@ class BotsKey:
         return self
 
     def ingest_from_pass(self, secret_path: str) -> str:
-        """从 Unix pass 自动智能识别所有行中的 WIF 格式字符串，返回用户名及导入的Key数"""
+        """从 Unix pass 自动智能识别所有行中的 WIF 格式私钥"""
         self.clear_current_key()
         result = subprocess.run(
             ["pass", secret_path],
@@ -148,7 +159,6 @@ class BotsKey:
             account = lines[0].strip()
             loaded_count = 0
 
-            # 遍历后续所有行，智能寻找合法的 WIF 私钥（通常以 5 开头）
             for line in lines[1:]:
                 clean_line = line.strip()
                 if ":" in clean_line:
@@ -168,7 +178,7 @@ class BotsKey:
             gc.collect()
 
     def ingest_from_file(self, filepath: str) -> str:
-        """从本地凭证文件（如 credentials.txt）智能提取所有 WIF 密钥"""
+        """从本地凭证文件（如 credentials.txt）提取所有 WIF 密钥"""
         self.clear_current_key()
         with open(filepath, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f.readlines() if line.strip()]
@@ -199,17 +209,19 @@ class BotsKey:
         self.clear_current_key()
 
     @sandbox_execute
-    def sign_message(self, decrypted_store: dict, message_str: str) -> dict:
-        """默认取字典中的第一个 key 作为 active key 签名消息"""
-        first_pub = list(decrypted_store.keys())[0]
-        wif_bytes = decrypted_store[first_pub]
-        pKey = PrivateKey.from_wif(wif_bytes.decode('utf-8'))
-        pub_key = pKey.get_public_key()
+    def sign_message(self, decrypted_store: dict, pub_key: str, message_str: str) -> dict:
+        """使用指定的公钥对文本消息进行签名"""
+        clean_pub = str(pub_key).strip()
+        if clean_pub not in decrypted_store:
+            raise KeyError(f"密钥管理器中未找到指定公钥 [{clean_pub}] 对应的私钥")
 
+        wif_bytes = decrypted_store[clean_pub]
+        pKey = PrivateKey.from_wif(wif_bytes.decode('utf-8'))
         sig_bytes = pKey.sign_message(message_str)
+
         return {
             "data": message_str,
-            "pubkey": pub_key,
+            "pubkey": clean_pub,
             "signature": hexlify(sig_bytes).decode('ascii')
         }
 
@@ -217,15 +229,20 @@ class BotsKey:
         from btsbots.graphene_light import verify_message as bts_verify_message
         from binascii import unhexlify
         return bts_verify_message(
-                payload["data"], unhexlify(payload["signature"]), payload["pubkey"])
+            payload["data"], unhexlify(payload["signature"]), payload["pubkey"]
+        )
 
     @sandbox_execute
-    def sign_transaction(self, decrypted_store: dict, payload: dict) -> str:
+    def sign_transaction(self, decrypted_store: dict, pub_key: str, payload: dict) -> dict:
+        """使用指定的公钥对 BitShares 交易载荷进行序列化签名"""
         import bitsharesbase.signedtransactions as transactions
         from binascii import unhexlify, hexlify
 
-        first_pub = list(decrypted_store.keys())[0]
-        pKey = PrivateKey.from_wif(decrypted_store[first_pub].decode('utf-8'))
+        clean_pub = str(pub_key).strip()
+        if clean_pub not in decrypted_store:
+            raise KeyError(f"密钥管理器中未找到指定公钥 [{clean_pub}] 对应的私钥，无法签署交易")
+
+        pKey = PrivateKey.from_wif(decrypted_store[clean_pub].decode('utf-8'))
 
         transaction = transactions.Signed_Transaction(
             ref_block_num=payload["ref_block_num"],
@@ -244,56 +261,51 @@ class BotsKey:
         return final_payload
 
     @sandbox_execute
-    def encrypt_memo(self, decrypted_store: dict, payload: dict) -> dict:
+    def encrypt_memo(self, decrypted_store: dict, my_pub_key: str, to_pub_key: str, message: str) -> dict:
+        """使用指定的发起方公钥和接收方公钥对 Memo 内容进行 Diffie-Hellman 加密"""
         from graphenebase.account import PrivateKey as GPrivateKey, PublicKey as GPublicKey
         from graphenebase.memo import encode_memo
         import random
 
-        pub_key = GPublicKey(payload["to"], prefix="BTS")
+        clean_my_pub = str(my_pub_key).strip()
+        if clean_my_pub not in decrypted_store:
+            raise KeyError(f"密钥管理器中未找到发件方公钥 [{clean_my_pub}] 对应的私钥，无法加密 Memo")
 
-        # 智能查找：如果有两把以上 Key，优先尝试使用 memo 对应的私钥；否则降级使用第一把 Key
-        target_wif = None
-        my_memo_pub = payload.get("my_memo_pub")
-
-        if my_memo_pub and my_memo_pub in decrypted_store:
-            target_wif = decrypted_store[my_memo_pub].decode('utf-8')
-        else:
-            first_pub = list(decrypted_store.keys())[-1] # 通常第二把或最后一把是 memo key
-            target_wif = decrypted_store[first_pub].decode('utf-8')
-
+        target_wif = decrypted_store[clean_my_pub].decode('utf-8')
         priv_key = GPrivateKey(target_wif, prefix="BTS")
+        to_pub_obj = GPublicKey(to_pub_key, prefix="BTS")
+
         nonce_int = random.randint(100000000000000, 9007199254740991)
-        encrypted_hex = encode_memo(priv_key, pub_key, nonce_int, payload["message"])
+        encrypted_hex = encode_memo(priv_key, to_pub_obj, nonce_int, message)
 
         return {
             "from": str(priv_key.pubkey),
-            "to": str(pub_key),
+            "to": str(to_pub_obj),
             "nonce": str(nonce_int),
             "message": encrypted_hex
         }
 
     @sandbox_execute
-    def decrypt_memo(self, decrypted_store: dict, memo_info: dict) -> str:
+    def decrypt_memo(self, decrypted_store: dict, my_pub_key: str, memo_info: dict) -> str:
+        """使用已确认属于本机的公钥对链上 Memo 信息进行解密"""
         from graphenebase.account import PrivateKey as GPrivateKey, PublicKey as GPublicKey
         from graphenebase.memo import decode_memo
 
-        keys = memo_info['k']
-        target_wif = None
-        for pub, wif_bytes in decrypted_store.items():
-            if pub == keys[0] or pub == keys[1]:
-                target_wif = wif_bytes.decode('utf-8')
-                break
+        clean_my_pub = str(my_pub_key).strip()
+        if clean_my_pub not in decrypted_store:
+            raise KeyError(f"密钥管理器中未找到指定解密公钥 [{clean_my_pub}] 对应的私钥")
 
-        if not target_wif:
-            first_pub = list(decrypted_store.keys())[-1]
-            target_wif = decrypted_store[first_pub].decode('utf-8')
+        keys = memo_info.get('k', [])
+        if not keys or len(keys) < 2:
+            raise ValueError("Memo 数据缺少通信双方公钥对")
 
+        # 对方公钥为 keys 中非当前解密公钥的另一个
+        other_pub_str = keys[1] if clean_my_pub == keys[0] else keys[0]
+        other_pub_obj = GPublicKey(other_pub_str, prefix="BTS")
+
+        target_wif = decrypted_store[clean_my_pub].decode('utf-8')
         priv_key = GPrivateKey(target_wif, prefix="BTS")
-        my_pub = str(priv_key.pubkey)
-        pub_key = keys[1] if my_pub == keys[0] else keys[0]
-        pub_key_obj = GPublicKey(pub_key, prefix="BTS")
         nonce_int = int(memo_info["n"])
 
-        plaintext = decode_memo(priv_key, pub_key_obj, nonce_int, memo_info["m"])
+        plaintext = decode_memo(priv_key, other_pub_obj, nonce_int, memo_info["m"])
         return plaintext
-from binascii import hexlify

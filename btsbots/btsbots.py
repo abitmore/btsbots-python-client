@@ -5,28 +5,26 @@ class BTSBots(BotsClient):
         await super().run()
         # 最新区块信息
         await self.subscribe("chainBlockHeadStream")
-        # 手续费
+        # 手续费参数
         await self.subscribe("chainGlobalProperties")
 
     async def make_transaction(self, raw_ops: list[dict], isSim: bool=False) -> int:
         """
-        接受交易请求格式如下:
-        {"type": xx, "params": xx}
-        其中type可以为 "limit_order_create/limit_order_cancel/transfer/account_create"
+        接受交易请求并完成签名广播
         """
         try:
-            # 1. build operations
+            # 1. 构建 operations
             ops = []
             for raw_op in raw_ops:
                 op = await self._build_op(self.bts_id, raw_op)
                 ops.append(op)
-            # 2. fill fees
+            # 2. 填充链上手续费
             self._fill_ops_fee(ops)
-            # 3. sign and broadcast
+            # 3. 签名并广播 (指定使用 Active Key)
             block = await self._sign_and_broadcast(ops, isSim)
             return block
         except Exception as e:
-            print(f"🚨[交易失败] {e}")
+            print(f"🚨 [交易失败] {e}")
             raise
 
     def _get_ref_block_info(self) -> tuple[int, int]:
@@ -67,18 +65,20 @@ class BTSBots(BotsClient):
     def _fill_op_fee(self, op: list, fee_doc: dict):
         from binascii import unhexlify
         op_code = op[0]
-        item = fee_doc[op[0]]
-        if op_code == 5:
+        item = fee_doc[op_code]
+        if op_code == 5: # account_create
             calculated_fee = int(item[1].get("basic_fee"))
             total_bytes = 143 + len((op[1]["name"]).encode('utf-8'))
             calculated_fee += total_bytes * item[1].get("price_per_kbyte") // 1024
         else:
             calculated_fee = int(item[1].get("fee"))
-        if op_code == 0 and op[1].get("memo"):
+
+        if op_code == 0 and op[1].get("memo"): # transfer memo
             cipher_bytes_len = len(unhexlify(op[1]["memo"]["message"]))
             varint_len = 2
             total_bytes = 33 + 33 + 8 + varint_len + cipher_bytes_len
             calculated_fee += total_bytes * item[1].get("price_per_kbyte") // 1024
+        
         op[1]["fee"]["amount"] = calculated_fee
 
     async def _sign_and_broadcast(self, ops: list, isSim: bool=False) -> int:
@@ -86,7 +86,7 @@ class BTSBots(BotsClient):
         try:
             ref_block_num, ref_block_prefix = self._get_ref_block_info()
             block_time = self._get_chain_time()
-            dt = datetime.fromtimestamp(block_time+30)
+            dt = datetime.fromtimestamp(block_time + 30)
             expiration = dt.strftime("%Y-%m-%dT%H:%M:%S")
             payload = {
                 "ref_block_num": int(ref_block_num),
@@ -95,24 +95,23 @@ class BTSBots(BotsClient):
                 "operations": ops
             }
 
-            # 使用统一的 key_manager 签名交易
-            finalized_tx_json = self.key_manager.sign_transaction(payload)
+            # 🌟 必须使用账号的 Active Key 签署交易
+            active_pub = await self._resolve_account_active_pubkey(self.account_name)
+            finalized_tx_json = self.key_manager.sign_transaction(active_pub, payload)
 
             if isSim:
                 result = {"status": "SUCCESS", "blockNum": 1644}
             else:
                 result = await self.call("broadcastTransaction", finalized_tx_json)
-            if(result["status"] == "FAIL"):
-                print(f"  交易广播失败：{result['message']}")
-                raise RuntimeError(f"  交易广播失败：{result['message']}")
+            if result.get("status") == "FAIL":
+                print(f"  交易广播失败：{result.get('message')}")
+                raise RuntimeError(f"  交易广播失败：{result.get('message')}")
             block_num = result["blockNum"]
 
             print(f"  发送成功，交易区块号: {block_num}")
             return block_num
         except Exception as broadcast_err:
             print(f"  [!] 交易被节点拒绝，错误明细: {broadcast_err}")
-            #import traceback
-            #traceback.print_exc()
             raise
 
     async def _build_op(self, uid: str, raw_op: dict) -> list:
@@ -128,18 +127,21 @@ class BTSBots(BotsClient):
             _op = await self._build_op_limit_order_cancel(uid, op_params)
         elif op_type == "account_create":
             _op = await self._build_op_account_create(uid, op_params)
+        elif op_type == "withdraw_vesting":
+            _op = await self._build_op_withdraw_vesting(uid, op_params)
 
         if _op is None:
-            raise RuntimeError(f"未支持的交易类型 {op_type}")
+            raise RuntimeError(f"未支持的交易类型: {op_type}")
         return _op
 
     async def _build_op_transfer(self, uid: str, op_params: dict) -> list:
+        memo_payload = None
         if op_params.get("memo"):
             memo_payload = await self.encrypt_memo(op_params)
 
         _, to_id = await self.get_account_brief(op_params.get("to_account"))
         _, asset_id, asset_prec = await self.get_asset_brief(op_params.get("asset"))
-        amount = int(op_params.get("amount") * (10 ** asset_prec))
+        amount = int(float(op_params.get("amount")) * (10 ** asset_prec))
         transfer_payload = {
             "fee": {"amount": 0, "asset_id": "1.3.0"},
             "from": str(uid),
@@ -150,7 +152,7 @@ class BTSBots(BotsClient):
             },
             "extensions": []
         }
-        if op_params.get("memo"):
+        if memo_payload:
             transfer_payload["memo"] = memo_payload
 
         return [0, transfer_payload]
@@ -197,7 +199,6 @@ class BTSBots(BotsClient):
         return [2, cancel_payload]
 
     async def _build_op_account_create(self, uid: str, op_params: dict) -> list:
-        """实现 BitShares 账号注册 (opcode 5: account_create)"""
         account_create_payload = {
             "fee": {"amount": 0, "asset_id": "1.3.0"},
             "registrar": str(uid),
@@ -227,15 +228,84 @@ class BTSBots(BotsClient):
         }
         return [5, account_create_payload]
 
-    async def encrypt_memo(self, op_params: dict):
-        if not self.key_manager:
-            raise ValueError("Need import keys first")
-        _info = await self.get_account_info(op_params.get("to_account"))
-        payload = {
-            "to": _info['k']['m'],
-            "message": op_params["memo"],
-            "my_memo_pub": _info.get('k', {}).get('m')
-        }
-        # 使用统一的 key_manager 加密 memo
-        return self.key_manager.encrypt_memo(payload)
+    async def _build_op_withdraw_vesting(self, uid: str, op_params: dict) -> list:
+        """实现 BitShares 提现归属余额操作 (opcode 33: withdraw_vesting)"""
+        asset_symbol_or_id = op_params["asset"]
+        if asset_symbol_or_id.startswith("1.3."):
+            asset_id = asset_symbol_or_id
+            _, _, asset_prec = await self.get_asset_brief(asset_id)
+        else:
+            _, asset_id, asset_prec = await self.get_asset_brief(asset_symbol_or_id)
 
+        raw_amount = int(float(op_params["amount"]) * (10 ** asset_prec))
+
+        withdraw_payload = {
+            "fee": {"amount": 0, "asset_id": "1.3.0"},
+            "vesting_balance": str(op_params["vesting_balance"]),
+            "owner": str(uid),
+            "amount": {
+                "amount": raw_amount,
+                "asset_id": asset_id
+            }
+        }
+        return [33, withdraw_payload]
+
+    async def encrypt_memo(self, op_params: dict) -> dict:
+        """
+        Memo 加密策略：
+        1. 接收方：提取目标账号的 Memo Key (k.m)；
+        2. 发起方：优先使用当前账号的 Memo Key，若不在本地密钥库中，降级尝试 Active Key；若均不在则报错。
+        """
+        if not self.key_manager:
+            raise ValueError("密钥管理器未初始化")
+
+        # 1. 目标公钥
+        to_account_info = await self.get_account_info(op_params.get("to_account"))
+        to_memo_pub = to_account_info.get('k', {}).get('m')
+        if not to_memo_pub:
+            raise ValueError(f"目标账号 [{op_params.get('to_account')}] 未在链上设置 Memo Key")
+
+        # 2. 本方公钥选择 (优先 Memo Key，降级 Active Key)
+        my_account_info = await self.get_account_info(self.account_name)
+        my_memo_pub = my_account_info.get('k', {}).get('m')
+        my_active_keys = my_account_info.get('k', {}).get('a', [])
+
+        chosen_my_pub = None
+        if my_memo_pub and self.key_manager.has_key(my_memo_pub):
+            chosen_my_pub = my_memo_pub
+        else:
+            for active_pub in my_active_keys:
+                if self.key_manager.has_key(active_pub):
+                    chosen_my_pub = active_pub
+                    break
+
+        if not chosen_my_pub:
+            raise KeyError(
+                f"当前账号 [{self.account_name}] 的 Memo Key ({my_memo_pub}) 及 Active Key ({my_active_keys}) "
+                f"均未在本地密钥库中导入，无法签署加密 Memo！"
+            )
+
+        return self.key_manager.encrypt_memo(chosen_my_pub, to_memo_pub, op_params["memo"])
+
+    async def decrypt_memo(self, memo_info: dict) -> str:
+        """
+        Memo 解密策略：
+        检查链上 memo 信息中包含的通信双方公钥 (k: [pub1, pub2])，自动查找哪一把存在于本地密钥库，显式传参解密。
+        """
+        if not self.key_manager:
+            raise ValueError("密钥管理器未初始化")
+
+        keys = memo_info.get('k', [])
+        if not keys or len(keys) < 2:
+            raise ValueError("Memo 数据不合法 (缺少双方公钥信息)")
+
+        matched_my_pub = None
+        for pub in keys:
+            if self.key_manager.has_key(pub):
+                matched_my_pub = pub
+                break
+
+        if not matched_my_pub:
+            raise KeyError(f"链上 Memo 指定的接收/发送公钥对 {keys} 均不在当前本地私钥库中，无法解密")
+
+        return self.key_manager.decrypt_memo(matched_my_pub, memo_info)

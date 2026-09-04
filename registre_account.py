@@ -91,8 +91,8 @@ class RegisterClient(MeteorDDPClient):
             print(f" ⚠️ 请务必妥善保管该文件，切勿泄露给任何人！")
             print(f"================================================================")
             print(f" 🚀 下一步指引 (使用 --keyfile 直接加载本地凭证文件):")
-            print(f" 1. 启动签名守护: python sign_bots.py --keyfile {filename}")
-            print(f" 2. 获取 OTP 登录: python get_otp.py --keyfile {filename}")
+            print(f" 1. 启动签名守护: uv run sign_bots.py --keyfile {filename}")
+            print(f" 2. 获取 OTP 登录: uv run get_otp.py --keyfile {filename}")
             print(f"================================================================")
 
         except Exception as err:

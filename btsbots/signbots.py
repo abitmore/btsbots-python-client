@@ -188,6 +188,13 @@ class SignBots(BTSBots):
             summary_desc = f"撤销限价订单 [ID: {order_id}]"
             human_data = {"订单ID": order_id}
 
+        elif op_type == "withdraw_vesting":
+            vb_id = params.get("vesting_balance")
+            amount = params.get("amount")
+            asset = params.get("asset")
+            summary_desc = f"提现归属余额 [{vb_id}] 金额: {amount} {asset}"
+            human_data = {"归属余额ID": vb_id, "金额": f"{amount} {asset}"}
+
         elif op_type == "oauth_login":
             site = params.get("site")
             client_id = params.get("client_id")
@@ -245,7 +252,7 @@ class SignBots(BTSBots):
             await self.oauth_handle(doc_id, fields)
             return
 
-        is_safe, fee_msg = self._check_fee_doc([0, 1, 2, 5])
+        is_safe, fee_msg = self._check_fee_doc([0, 1, 2, 5, 33])
         if not is_safe:
             print(f"   ❌ 状态结果: 【拦截拒绝】")
             print(f"   🚨 拒绝原因: {fee_msg}")
@@ -326,7 +333,9 @@ class SignBots(BTSBots):
             return
 
         try:
-            auth_payload = self._generate_auth_payload(self.account_name, site, token, ip)
+            # 🌟 显式定位 Active Key 签名
+            active_pub = await self._resolve_account_active_pubkey(self.account_name)
+            auth_payload = self._generate_auth_payload(self.account_name, active_pub, site, token, ip)
             final_payload = {
                 "client_id": str(client_id).lower().strip(),
                 "verify": auth_payload.get("verify")
@@ -427,6 +436,17 @@ class SignBots(BTSBots):
 
     async def _audit_security_strategy(self, op_type: str, params: dict, sender_id: str, device_alias: str, pin_code_provided: Optional[str]) -> Tuple[bool, str, bool, str]:
         try:
+            if op_type == "withdraw_vesting":
+                unlimited_cfg = self.config.get("unlimited_payments", {})
+                authorized_devices = unlimited_cfg.get("authorized_devices", [])
+                if device_alias not in authorized_devices:
+                    return False, f"设备 [{device_alias}] 没有权限执行提现分红 (withdraw_vesting) 操作", False, ""
+                
+                if not params.get("vesting_balance") or not params.get("amount") or not params.get("asset"):
+                    return False, "withdraw_vesting 参数不完整 (缺少 vesting_balance, amount 或 asset)", False, ""
+
+                return True, "提现分红安全策略校验通过", False, ""
+
             if op_type == "transfer":
                 unlimited_cfg = self.config.get("unlimited_payments", {})
                 authorized_devices = unlimited_cfg.get("authorized_devices", [])
